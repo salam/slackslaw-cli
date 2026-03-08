@@ -1161,7 +1161,7 @@ WHERE m.${text_col} LIKE '%${q_escaped}%'"
     fi
 
     [[ -n "$channel_filter" ]] && \
-      sql+=" AND LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}')"
+      sql+=" AND (LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}') OR m.CHANNEL_ID = '${channel_filter}')"
     [[ -n "$author_filter" ]] && \
       sql+=" AND (LOWER(COALESCE(u.USERNAME,'')) LIKE LOWER('%${author_filter}%'))"
 
@@ -1729,7 +1729,7 @@ WHERE CAST(m.ts AS REAL) > ${slack_ts}
   AND (m.${text_col} IS NOT NULL AND m.${text_col} != '')"
 
       [[ -n "$channel_filter" ]] && \
-        sql+=" AND LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}')"
+        sql+=" AND (LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}') OR m.CHANNEL_ID = '${channel_filter}')"
 
       if $mine_filter; then
         local mine_clause
@@ -1894,7 +1894,7 @@ for ws in workspaces_str.strip().split('\n'):
           AND m.{text_col} IS NOT NULL AND m.{text_col} != ''
     \"\"\"
     if channel_filter:
-        sql += f\" AND m.CHANNEL_ID IN (SELECT ID FROM {ch_table} WHERE LOWER(NAME) = LOWER('{channel_filter}'))\"
+        sql += f\" AND (m.CHANNEL_ID IN (SELECT ID FROM {ch_table} WHERE LOWER(NAME) = LOWER('{channel_filter}')) OR m.CHANNEL_ID = '{channel_filter}')\"
     sql += f' ORDER BY CAST(m.ts AS REAL) ASC LIMIT {limit}'
 
     rows = conn.execute(sql).fetchall()
@@ -1981,8 +1981,7 @@ elif 'error' in resp:
     print('Error: ' + resp['error'].get('message', str(resp['error'])), file=sys.stderr)
     sys.exit(1)
 "
-  else
-    [[ -z "${ANTHROPIC_API_KEY:-}" ]] && die "ANTHROPIC_API_KEY not set."
+  elif [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     curl -sS https://api.anthropic.com/v1/messages \
       -H "Content-Type: application/json" \
       -H "x-api-key: ${ANTHROPIC_API_KEY}" \
@@ -2008,6 +2007,16 @@ elif 'error' in resp:
     print('Error: ' + resp['error'].get('message', str(resp['error'])), file=sys.stderr)
     sys.exit(1)
 "
+  else
+    # No API key — fall back to claude CLI
+    if ! command -v claude &>/dev/null; then
+      die "ANTHROPIC_API_KEY not set and 'claude' CLI not found. Set ANTHROPIC_API_KEY or install Claude Code."
+    fi
+    local prompt
+    prompt="${system_prompt}
+
+Question: ${question}"
+    claude -p "$prompt"
   fi
 }
 
@@ -2047,19 +2056,21 @@ cmd_export() {
   local format="md"
   local output_file=""
   local target_ws=""
+  local deeplinks="1"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --channel|-c)   shift; channel_filter="${1#\#}" ;;
-      --format)       shift; format="$1" ;;
-      --output|-o)    shift; output_file="$1" ;;
-      --workspace|-w) shift; target_ws="$1" ;;
-      *)              warn "Unknown export option: $1" ;;
+      --channel|-c)     shift; channel_filter="${1#\#}" ;;
+      --format)         shift; format="$1" ;;
+      --output|-o)      shift; output_file="$1" ;;
+      --workspace|-w)   shift; target_ws="$1" ;;
+      --no-deeplinks)   deeplinks="0" ;;
+      *)                warn "Unknown export option: $1" ;;
     esac
     shift
   done
 
-  [[ -z "$channel_filter" ]] && die "Usage: slackslaw export --channel \"#name\" [--format md|html] [--output file] [--workspace W]"
+  [[ -z "$channel_filter" ]] && die "Usage: slackslaw export --channel \"#name\" [--format md|html] [--output file] [--workspace W] [--no-deeplinks]"
 
   local workspaces
   if [[ -n "$target_ws" ]]; then
@@ -2110,41 +2121,381 @@ cmd_export() {
 
       local rows_json
       rows_json=$(sqlite3 -json "$db" "
-        SELECT m.ts,
+        SELECT m.TS AS ts,
           ${user_name_expr} AS author,
           COALESCE(c.NAME, m.CHANNEL_ID, '') AS channel,
-          m.${text_col} AS text,
-          m.CHANNEL_ID AS channel_id
+          MAX(m.${text_col}) AS text,
+          m.CHANNEL_ID AS channel_id,
+          MAX(m.THREAD_TS) AS thread_ts,
+          ${user_expr} AS user_id,
+          MAX(json_extract(m.DATA, '\$.files')) AS files,
+          MAX(json_extract(m.DATA, '\$.reactions')) AS reactions,
+          MAX(json_extract(m.DATA, '\$.reply_count')) AS reply_count,
+          MAX(json_extract(m.DATA, '\$.attachments')) AS attachments
         FROM ${msg_table} m
         LEFT JOIN ${ch_dedup} c ON c.ID = m.CHANNEL_ID
         LEFT JOIN ${user_dedup} u ON u.ID = ${user_expr}
-        WHERE LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}')
-          AND m.${text_col} IS NOT NULL AND m.${text_col} != ''
+        WHERE (LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}') OR m.CHANNEL_ID = '${channel_filter}')
+          AND (m.${text_col} IS NOT NULL AND m.${text_col} != '' OR m.NUM_FILES > 0)
         GROUP BY m.TS, m.CHANNEL_ID
-        ORDER BY CAST(m.ts AS REAL) ASC;
+        ORDER BY CAST(m.TS AS REAL) ASC;
       " 2>/dev/null || echo "[]")
 
       [[ "$rows_json" == "[]" || -z "$rows_json" ]] && continue
 
-      python3 - "$db" "$user_table" "$format" "$channel_filter" "$rows_json" <<'PYEOF'
-import json, re, sqlite3, sys
+      python3 - "$db" "$user_table" "$format" "$channel_filter" "$rows_json" "$deeplinks" "$ws" "$ws_dir" <<'PYEOF'
+import html as html_mod
+import json, os, re, sqlite3, sys, urllib.request, urllib.error
 from datetime import datetime, timezone
 
-db_path, user_table, fmt, ch_name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+db_path, user_table, fmt, ch_filter = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 rows = json.loads(sys.argv[5])
+deeplinks_on = sys.argv[6] == "1" if len(sys.argv) > 6 else True
+workspace = sys.argv[7] if len(sys.argv) > 7 else ""
+ws_dir = sys.argv[8] if len(sys.argv) > 8 else ""
+uploads_dir = os.path.join(ws_dir, "__uploads") if ws_dir else ""
 if not rows:
     sys.exit(0)
 
+# Resolve channel display name from first row
+ch_name = rows[0].get("channel", "") or ch_filter
+channel_id = rows[0].get("channel_id", "")
+
 conn = sqlite3.connect(db_path)
 user_map = {}
+avatar_map = {}
 try:
     for r in conn.execute(f"SELECT ID, USERNAME FROM {user_table} GROUP BY ID"):
         user_map[r[0]] = r[1]
-except:
+except Exception:
+    try:
+        for r in conn.execute(f"SELECT ID, COALESCE(real_name, name) FROM {user_table} GROUP BY ID"):
+            user_map[r[0]] = r[1]
+    except Exception:
+        pass
+# Try to load profile pics from DATA JSON column
+try:
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({user_table})").fetchall()]
+    if "DATA" in cols:
+        for r in conn.execute(f"SELECT ID, json_extract(DATA, '$.profile.image_48') FROM {user_table} WHERE json_extract(DATA, '$.profile.image_48') IS NOT NULL GROUP BY ID"):
+            if r[1]:
+                avatar_map[r[0]] = r[1]
+    elif "profile" in cols:
+        for r in conn.execute(f"SELECT ID, json_extract(profile, '$.image_48') FROM {user_table} WHERE json_extract(profile, '$.image_48') IS NOT NULL GROUP BY ID"):
+            if r[1]:
+                avatar_map[r[0]] = r[1]
+except Exception:
+    pass
+# Try to get team_id from first user's DATA
+team_id = ""
+try:
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({user_table})").fetchall()]
+    if "DATA" in cols:
+        row = conn.execute(f"SELECT json_extract(DATA, '$.team_id') FROM {user_table} WHERE json_extract(DATA, '$.team_id') IS NOT NULL LIMIT 1").fetchone()
+        if row and row[0]:
+            team_id = row[0]
+except Exception:
     pass
 conn.close()
 
+# Color palette for initial-based fallback avatars
+_AVATAR_COLORS = ["#e8912d", "#2bac76", "#e01e5a", "#1264a3", "#8c5db0",
+                   "#d4a843", "#e25950", "#36c5f0", "#4a154b", "#2eb67d"]
+def avatar_fallback(name, uid=""):
+    """Generate an SVG data URI with the user's initial."""
+    initial = (name or "?")[0].upper()
+    idx = sum(ord(c) for c in (uid or name or "?")) % len(_AVATAR_COLORS)
+    color = _AVATAR_COLORS[idx]
+    svg = f'<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36"><rect width="36" height="36" rx="4" fill="{color}"/><text x="18" y="24" text-anchor="middle" fill="white" font-family="system-ui,sans-serif" font-size="18" font-weight="600">{initial}</text></svg>'
+    import base64
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode()).decode()
+
+# ── Emoji map (top ~100 Slack emoji → Unicode) ──
+EMOJI_MAP = {
+    "smile": "\U0001f604", "laughing": "\U0001f606", "blush": "\U0001f60a",
+    "smiley": "\U0001f603", "relaxed": "\u263a\ufe0f", "smirk": "\U0001f60f",
+    "heart_eyes": "\U0001f60d", "kissing_heart": "\U0001f618",
+    "kissing_closed_eyes": "\U0001f61a", "flushed": "\U0001f633",
+    "relieved": "\U0001f60c", "satisfied": "\U0001f606", "grin": "\U0001f601",
+    "wink": "\U0001f609", "stuck_out_tongue_winking_eye": "\U0001f61c",
+    "stuck_out_tongue_closed_eyes": "\U0001f61d", "grinning": "\U0001f600",
+    "kissing": "\U0001f617", "stuck_out_tongue": "\U0001f61b",
+    "sleeping": "\U0001f634", "worried": "\U0001f61f", "frowning": "\U0001f626",
+    "anguished": "\U0001f627", "open_mouth": "\U0001f62e", "grimacing": "\U0001f62c",
+    "confused": "\U0001f615", "hushed": "\U0001f62f", "expressionless": "\U0001f611",
+    "unamused": "\U0001f612", "sweat_smile": "\U0001f605", "sweat": "\U0001f613",
+    "disappointed_relieved": "\U0001f625", "weary": "\U0001f629",
+    "pensive": "\U0001f614", "disappointed": "\U0001f61e", "confounded": "\U0001f616",
+    "fearful": "\U0001f628", "cold_sweat": "\U0001f630", "persevere": "\U0001f623",
+    "cry": "\U0001f622", "sob": "\U0001f62d", "joy": "\U0001f602",
+    "astonished": "\U0001f632", "scream": "\U0001f631", "tired_face": "\U0001f62b",
+    "angry": "\U0001f620", "rage": "\U0001f621", "triumph": "\U0001f624",
+    "sleepy": "\U0001f62a", "yum": "\U0001f60b", "mask": "\U0001f637",
+    "sunglasses": "\U0001f60e", "dizzy_face": "\U0001f635",
+    "imp": "\U0001f47f", "smiling_imp": "\U0001f608", "neutral_face": "\U0001f610",
+    "no_mouth": "\U0001f636", "innocent": "\U0001f607", "alien": "\U0001f47d",
+    "yellow_heart": "\U0001f49b", "blue_heart": "\U0001f499",
+    "purple_heart": "\U0001f49c", "heart": "\u2764\ufe0f", "green_heart": "\U0001f49a",
+    "broken_heart": "\U0001f494", "heartbeat": "\U0001f493",
+    "heartpulse": "\U0001f497", "sparkling_heart": "\U0001f496",
+    "star": "\u2b50", "star2": "\U0001f31f", "dizzy": "\U0001f4ab",
+    "boom": "\U0001f4a5", "fire": "\U0001f525", "100": "\U0001f4af",
+    "thumbsup": "\U0001f44d", "+1": "\U0001f44d", "thumbsdown": "\U0001f44e",
+    "-1": "\U0001f44e", "ok_hand": "\U0001f44c", "punch": "\U0001f44a",
+    "fist": "\u270a", "v": "\u270c\ufe0f", "wave": "\U0001f44b",
+    "hand": "\u270b", "open_hands": "\U0001f450", "point_up": "\u261d\ufe0f",
+    "point_down": "\U0001f447", "point_left": "\U0001f448",
+    "point_right": "\U0001f449", "raised_hands": "\U0001f64c",
+    "pray": "\U0001f64f", "clap": "\U0001f44f", "muscle": "\U0001f4aa",
+    "eyes": "\U0001f440", "tongue": "\U0001f445", "lips": "\U0001f444",
+    "tada": "\U0001f389", "sparkles": "\u2728", "balloon": "\U0001f388",
+    "party_popper": "\U0001f389", "gift": "\U0001f381",
+    "bell": "\U0001f514", "rocket": "\U0001f680",
+    "thinking_face": "\U0001f914", "thinking": "\U0001f914",
+    "face_with_rolling_eyes": "\U0001f644", "rolling_eyes": "\U0001f644",
+    "slightly_smiling_face": "\U0001f642", "slightly_frowning_face": "\U0001f641",
+    "upside_down_face": "\U0001f643", "zipper_mouth_face": "\U0001f910",
+    "money_mouth_face": "\U0001f911", "nerd_face": "\U0001f913",
+    "hugging_face": "\U0001f917", "hugging": "\U0001f917",
+    "skull": "\U0001f480", "robot_face": "\U0001f916",
+    "see_no_evil": "\U0001f648", "hear_no_evil": "\U0001f649",
+    "speak_no_evil": "\U0001f64a", "white_check_mark": "\u2705",
+    "heavy_check_mark": "\u2714\ufe0f", "x": "\u274c",
+    "warning": "\u26a0\ufe0f", "exclamation": "\u2757",
+    "question": "\u2753", "bulb": "\U0001f4a1", "mega": "\U0001f4e3",
+    "rotating_light": "\U0001f6a8", "lock": "\U0001f512", "key": "\U0001f511",
+    "mag": "\U0001f50d", "link": "\U0001f517", "email": "\U0001f4e7",
+    "phone": "\u260e\ufe0f", "computer": "\U0001f4bb", "speech_balloon": "\U0001f4ac",
+    "thought_balloon": "\U0001f4ad", "calendar": "\U0001f4c5",
+    "chart_with_upwards_trend": "\U0001f4c8", "heavy_plus_sign": "\u2795",
+    "heavy_minus_sign": "\u2796", "arrow_right": "\u27a1\ufe0f",
+    "large_blue_diamond": "\U0001f537", "large_orange_diamond": "\U0001f536",
+    "small_blue_diamond": "\U0001f539", "small_orange_diamond": "\U0001f538",
+}
+SKIN_TONES = {
+    "skin-tone-2": "\U0001f3fb", "skin-tone-3": "\U0001f3fc",
+    "skin-tone-4": "\U0001f3fd", "skin-tone-5": "\U0001f3fe",
+    "skin-tone-6": "\U0001f3ff",
+}
+
+def convert_emoji(text):
+    """Convert :emoji: and :emoji::skin-tone-N: to Unicode."""
+    def _repl(m):
+        name = m.group(1)
+        # Check for skin tone modifier
+        skin = ""
+        parts = name.split("::")
+        if len(parts) == 2:
+            name = parts[0]
+            skin = SKIN_TONES.get(parts[1], "")
+        elif ":" in name:
+            # :thumbsup::skin-tone-3: pattern captured differently
+            pass
+        base = EMOJI_MAP.get(name)
+        if base:
+            return base + skin
+        return m.group(0)  # leave unknown emoji as-is
+    # Handle :emoji::skin-tone-N: (two colons between)
+    text = re.sub(r':([a-z0-9_+-]+(?:::skin-tone-[2-6])?):',  _repl, text)
+    return text
+
+# ── Syntax highlighting (simple regex-based) ──
+SYNTAX_RULES = {
+    "python": [
+        (r'\b(def|class|import|from|return|if|elif|else|for|while|with|as|try|except|finally|raise|yield|lambda|and|or|not|in|is|True|False|None|pass|break|continue|assert|global|nonlocal|del|async|await)\b', 'kw'),
+        (r'("""[\s\S]*?"""|\'\'\'[\s\S]*?\'\'\'|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')', 'str'),
+        (r'(#[^\n]*)', 'cmt'),
+        (r'\b(\d+\.?\d*)\b', 'num'),
+    ],
+    "javascript": [
+        (r'\b(const|let|var|function|return|if|else|for|while|do|switch|case|break|continue|new|this|class|extends|import|export|default|from|try|catch|finally|throw|async|await|yield|typeof|instanceof|of|in|true|false|null|undefined|void)\b', 'kw'),
+        (r'(`(?:[^`\\]|\\.)*`|"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\')', 'str'),
+        (r'(\/\/[^\n]*|\/\*[\s\S]*?\*\/)', 'cmt'),
+        (r'\b(\d+\.?\d*)\b', 'num'),
+    ],
+    "bash": [
+        (r'\b(if|then|else|elif|fi|for|do|done|while|until|case|esac|function|return|local|export|source|alias|unset|readonly|shift|exit|break|continue|declare|typeset|trap|eval|exec)\b', 'kw'),
+        (r'("(?:[^"\\]|\\.)*"|\'[^\']*\')', 'str'),
+        (r'(#[^\n]*)', 'cmt'),
+        (r'\b(\d+)\b', 'num'),
+    ],
+    "sql": [
+        (r'(?i)\b(SELECT|FROM|WHERE|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|TABLE|INDEX|INTO|VALUES|SET|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|NULL|IS|IN|BETWEEN|LIKE|ORDER|BY|GROUP|HAVING|LIMIT|OFFSET|AS|UNION|ALL|DISTINCT|EXISTS|CASE|WHEN|THEN|ELSE|END|COUNT|SUM|AVG|MAX|MIN|COALESCE|CAST|PRIMARY|KEY|FOREIGN|REFERENCES|CONSTRAINT|DEFAULT|CHECK|UNIQUE|VIEW|TRIGGER|PROCEDURE|FUNCTION|BEGIN|COMMIT|ROLLBACK)\b', 'kw'),
+        (r"('(?:[^'\\]|\\.)*')", 'str'),
+        (r'(--[^\n]*)', 'cmt'),
+        (r'\b(\d+\.?\d*)\b', 'num'),
+    ],
+    "json": [
+        (r'("(?:[^"\\]|\\.)*")\s*:', 'kw'),
+        (r':\s*("(?:[^"\\]|\\.)*")', 'str'),
+        (r'\b(true|false|null)\b', 'kw'),
+        (r'\b(\d+\.?\d*)\b', 'num'),
+    ],
+}
+# Aliases
+SYNTAX_RULES["py"] = SYNTAX_RULES["python"]
+SYNTAX_RULES["js"] = SYNTAX_RULES["javascript"]
+SYNTAX_RULES["ts"] = SYNTAX_RULES["javascript"]
+SYNTAX_RULES["typescript"] = SYNTAX_RULES["javascript"]
+SYNTAX_RULES["sh"] = SYNTAX_RULES["bash"]
+SYNTAX_RULES["shell"] = SYNTAX_RULES["bash"]
+SYNTAX_RULES["zsh"] = SYNTAX_RULES["bash"]
+
+def highlight_code(code, lang):
+    """Apply simple regex-based syntax highlighting."""
+    lang = (lang or "").strip().lower()
+    rules = SYNTAX_RULES.get(lang)
+    if not rules:
+        return html_mod.escape(code)
+    escaped = html_mod.escape(code)
+    # Apply rules with placeholder approach to avoid double-matching
+    placeholders = []
+    def _placeholder(cls, text):
+        idx = len(placeholders)
+        placeholders.append(f'<span class="hl-{cls}">{text}</span>')
+        return f"\x00PH{idx}\x00"
+    for pattern, cls in rules:
+        def _repl(m, cls=cls):
+            return _placeholder(cls, m.group(0))
+        escaped = re.sub(pattern, _repl, escaped)
+    # Restore placeholders
+    for i, val in enumerate(placeholders):
+        escaped = escaped.replace(f"\x00PH{i}\x00", val)
+    return escaped
+
+def render_code_blocks(text_html):
+    """Convert fenced code blocks and inline code in already-escaped HTML."""
+    # Fenced code blocks (```lang\n...\n```)
+    def _fenced(m):
+        lang = m.group(1) or ""
+        code = m.group(2)
+        # Unescape <br> back to newlines for code
+        code = code.replace("<br>", "\n").replace("&lt;br&gt;", "\n")
+        label = f'<span class="code-lang">{html_mod.escape(lang)}</span>' if lang else ""
+        # Re-highlight (code was already escaped; unescape for re-processing)
+        raw = html_mod.unescape(code)
+        highlighted = highlight_code(raw, lang)
+        return f'{label}<pre class="code-block"><code>{highlighted}</code></pre>'
+    text_html = re.sub(r'```(\w*)\s*<br>([\s\S]*?)```', _fenced, text_html)
+    # Inline code
+    text_html = re.sub(r'`([^`\n]+?)`', r'<code class="inline-code">\1</code>', text_html)
+    return text_html
+
+# ── Link preview (OpenGraph) ──
+_og_cache = {}
+def fetch_og_preview(url):
+    """Fetch OpenGraph metadata for a URL. Returns dict or None."""
+    if url in _og_cache:
+        return _og_cache[url]
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "SlackslawExport/1.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            content = resp.read(64 * 1024).decode("utf-8", errors="replace")
+        og = {}
+        for prop in ("og:title", "og:description", "og:image"):
+            m = re.search(rf'<meta\s+(?:property|name)="{re.escape(prop)}"\s+content="([^"]*)"', content, re.I)
+            if not m:
+                m = re.search(rf'<meta\s+content="([^"]*)"\s+(?:property|name)="{re.escape(prop)}"', content, re.I)
+            if m:
+                og[prop] = html_mod.unescape(m.group(1))
+        _og_cache[url] = og if og else None
+        return _og_cache[url]
+    except Exception:
+        _og_cache[url] = None
+        return None
+
+def render_link_preview(url):
+    """Return HTML for a link preview card, or empty string."""
+    og = fetch_og_preview(url)
+    if not og:
+        return ""
+    title = html_mod.escape(og.get("og:title", ""))
+    desc = html_mod.escape(og.get("og:description", ""))
+    img = og.get("og:image", "")
+    parts = ['<div class="link-preview">']
+    if title:
+        parts.append(f'<div class="lp-title">{title}</div>')
+    if desc:
+        parts.append(f'<div class="lp-desc">{desc}</div>')
+    if img:
+        parts.append(f'<img class="lp-img" src="{html_mod.escape(img)}" loading="lazy" alt="">')
+    parts.append('</div>')
+    return "".join(parts) if title or desc else ""
+
+# ── Slack mrkdwn → HTML (token-placeholder pattern) ──
+def prettify_text_html(text):
+    """Convert Slack mrkdwn to HTML using token-placeholder pattern."""
+    if not text:
+        return ""
+    placeholders = []
+    def _ph(html_fragment):
+        idx = len(placeholders)
+        placeholders.append(html_fragment)
+        return f"\x00TK{idx}\x00"
+
+    # Step 1: Extract Slack tokens and replace with placeholders
+    def _repl_mention(m):
+        uid = m.group(1)
+        name = user_map.get(uid, uid)
+        if deeplinks_on and team_id:
+            return _ph(f'<a class="mention" href="https://app.slack.com/client/{team_id}/{uid}">@{html_mod.escape(name)}</a>')
+        return _ph(f'<span class="mention">@{html_mod.escape(name)}</span>')
+
+    def _repl_channel(m):
+        cid = m.group(1)
+        cname = m.group(2)
+        if deeplinks_on and team_id:
+            return _ph(f'<a class="mention" href="https://app.slack.com/client/{team_id}/{cid}">#{html_mod.escape(cname)}</a>')
+        return _ph(f'<span class="mention">#{html_mod.escape(cname)}</span>')
+
+    def _repl_url_labeled(m):
+        url, label = m.group(1), m.group(2)
+        preview = render_link_preview(url)
+        return _ph(f'<a href="{html_mod.escape(url)}" target="_blank" class="link">{html_mod.escape(label)}</a>{preview}')
+
+    def _repl_url_bare(m):
+        url = m.group(1)
+        preview = render_link_preview(url)
+        return _ph(f'<a href="{html_mod.escape(url)}" target="_blank" class="link">{html_mod.escape(url)}</a>{preview}')
+
+    def _repl_mailto(m):
+        addr, label = m.group(1), m.group(2)
+        return _ph(f'<a href="mailto:{html_mod.escape(addr)}" class="link">{html_mod.escape(label)}</a>')
+
+    def _repl_special(m):
+        cmd = m.group(1)
+        return _ph(f'<span class="mention">@{html_mod.escape(cmd)}</span>')
+
+    text = re.sub(r'<@([A-Z0-9]+)(?:\|[^>]*)?>', _repl_mention, text)
+    text = re.sub(r'<#([A-Z0-9]+)\|([^>]+)>', _repl_channel, text)
+    text = re.sub(r'<mailto:([^|>]+)\|([^>]+)>', _repl_mailto, text)
+    text = re.sub(r'<(https?://[^|>]+)\|([^>]+)>', _repl_url_labeled, text)
+    text = re.sub(r'<(https?://[^>]+)>', _repl_url_bare, text)
+    text = re.sub(r'<!([a-z]+)(?:\|[^>]*)?>', _repl_special, text)
+
+    # Step 2: HTML-escape the remaining text
+    text = html_mod.escape(text)
+    text = text.replace("\n", "<br>")
+
+    # Step 3: Restore placeholders
+    for i, val in enumerate(placeholders):
+        text = text.replace(f"\x00TK{i}\x00", val)
+
+    # Step 4: Emoji conversion
+    text = convert_emoji(text)
+
+    # Step 5: Code blocks (must come before bold/italic to avoid conflicts)
+    text = render_code_blocks(text)
+
+    # Step 6: Bold, italic, strikethrough
+    text = re.sub(r'(?<![\\])\*([^\*\n]+?)\*', r'<strong>\1</strong>', text)
+    text = re.sub(r'(?<![\\])_([^_\n]+?)_', r'<em>\1</em>', text)
+    text = re.sub(r'(?<![\\])~([^~\n]+?)~', r'<del>\1</del>', text)
+
+    return text
+
 def prettify_text(text):
+    """Markdown-flavored prettify (unchanged from original)."""
     if not text:
         return ""
     def repl_mention(m):
@@ -2159,37 +2510,244 @@ def prettify_text(text):
     text = re.sub(r'<!([a-z]+)(?:\|[^>]*)?>', r'@\1', text)
     return text
 
+# ── Read local file and encode as data URI ──
+import base64 as _b64
+def local_file_data_uri(file_id, filename, mime):
+    """Read file from local __uploads dir and return as data:... URI."""
+    if not uploads_dir or not file_id:
+        return None
+    path = os.path.join(uploads_dir, file_id, filename)
+    if not os.path.isfile(path):
+        # Try finding any file in the file_id directory
+        alt_dir = os.path.join(uploads_dir, file_id)
+        if os.path.isdir(alt_dir):
+            entries = os.listdir(alt_dir)
+            if entries:
+                path = os.path.join(alt_dir, entries[0])
+            else:
+                return None
+        else:
+            return None
+    try:
+        with open(path, "rb") as f:
+            data = f.read(10 * 1024 * 1024)  # 10MB max
+        return f"data:{mime};base64,{_b64.b64encode(data).decode()}"
+    except Exception:
+        return None
+
+# ── Render files/images ──
+def render_files(files_json):
+    if not files_json:
+        return ""
+    try:
+        files = json.loads(files_json) if isinstance(files_json, str) else files_json
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not files:
+        return ""
+    parts = []
+    for f in files:
+        mime = f.get("mimetype", "") or ""
+        name = f.get("name", "file")
+        file_id = f.get("id", "")
+        url = f.get("url_private", "") or f.get("permalink", "") or ""
+        if mime.startswith("image/"):
+            data_uri = local_file_data_uri(file_id, name, mime)
+            if data_uri:
+                parts.append(f'<div class="file-img"><img src="{data_uri}" alt="{html_mod.escape(name)}"></div>')
+            elif url:
+                parts.append(f'<div class="file-img"><img src="{html_mod.escape(url)}" alt="{html_mod.escape(name)}" loading="lazy"></div>')
+        elif mime.startswith(("video/", "audio/")):
+            tag = "video" if mime.startswith("video/") else "audio"
+            data_uri = local_file_data_uri(file_id, name, mime)
+            if data_uri:
+                parts.append(f'<div class="file-media"><{tag} controls src="{data_uri}"></{tag}></div>')
+            elif url:
+                parts.append(f'<div class="file-attach">\U0001f4ce <a href="{html_mod.escape(url)}" target="_blank">{html_mod.escape(name)}</a></div>')
+        else:
+            data_uri = local_file_data_uri(file_id, name, mime)
+            if data_uri:
+                parts.append(f'<div class="file-attach">\U0001f4ce <a href="{data_uri}" download="{html_mod.escape(name)}">{html_mod.escape(name)}</a></div>')
+            elif url:
+                parts.append(f'<div class="file-attach">\U0001f4ce <a href="{html_mod.escape(url)}" target="_blank">{html_mod.escape(name)}</a></div>')
+            else:
+                parts.append(f'<div class="file-attach">\U0001f4ce {html_mod.escape(name)}</div>')
+    return "".join(parts)
+
+# ── Render reactions ──
+def render_reactions(reactions_json):
+    if not reactions_json:
+        return ""
+    try:
+        reactions = json.loads(reactions_json) if isinstance(reactions_json, str) else reactions_json
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    if not reactions:
+        return ""
+    parts = ['<div class="reactions">']
+    for rxn in reactions:
+        name = rxn.get("name", "")
+        count = rxn.get("count", 1)
+        emoji = EMOJI_MAP.get(name, f":{name}:")
+        parts.append(f'<span class="reaction">{emoji} {count}</span>')
+    parts.append('</div>')
+    return "".join(parts)
+
+# ── Deep link for message timestamp ──
+def msg_deeplink(ts, ch_id):
+    if not deeplinks_on or not team_id or not ts or not ch_id:
+        return ""
+    ts_nodot = ts.replace(".", "")
+    return f"https://app.slack.com/archives/{ch_id}/p{ts_nodot}"
+
+# ── Single message renderer ──
+def render_message(r, is_reply=False):
+    ts = r.get("ts", "")
+    try:
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        dt = ts
+    author = r.get("author", "unknown")
+    uid = r.get("user_id", "")
+    text = r.get("text", "") or r.get("TXT", "") or ""
+    text_html = prettify_text_html(text)
+    files_html = render_files(r.get("files"))
+    reactions_html = render_reactions(r.get("reactions"))
+    reply_count = r.get("reply_count")
+
+    css_class = "reply" if is_reply else "msg"
+
+    # Avatar
+    avatar_url = avatar_map.get(uid, "") if uid else ""
+    if not avatar_url:
+        avatar_url = avatar_fallback(author, uid)
+    avatar_size = "28" if is_reply else "36"
+    avatar_html = f'<img class="avatar" src="{html_mod.escape(avatar_url)}" width="{avatar_size}" height="{avatar_size}" alt="">'
+
+    # Author with optional deep link
+    if deeplinks_on and team_id and uid:
+        author_html = f'<a class="author" href="https://app.slack.com/client/{team_id}/{uid}">{html_mod.escape(author)}</a>'
+    else:
+        author_html = f'<span class="author">{html_mod.escape(author)}</span>'
+
+    # Timestamp with optional deep link (light gray, next to author)
+    link = msg_deeplink(ts, r.get("channel_id", channel_id))
+    if link:
+        time_html = f'<a class="time" href="{link}" target="_blank">{dt}</a>'
+    else:
+        time_html = f'<span class="time">{dt}</span>'
+
+    # Reply count badge
+    badge = ""
+    if reply_count and not is_reply:
+        badge = f' <span class="reply-badge">{reply_count} {"reply" if reply_count == 1 else "replies"}</span>'
+
+    out = (f'<div class="{css_class}">'
+           f'<div class="msg-row">{avatar_html}'
+           f'<div class="msg-content">'
+           f'<div class="msg-header">{author_html}{time_html}{badge}</div>'
+           f'<div class="text">{text_html}</div>{files_html}{reactions_html}'
+           f'</div></div>')
+    return out
+
+# ── Main output ──
 if fmt == "html":
+    CSS = """
+body { font-family: 'Slack-Lato', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  max-width: 820px; margin: 2em auto; padding: 0 1.2em; line-height: 1.6; color: #1d1c1d; background: #fff; }
+h1 { font-size: 1.4em; border-bottom: 1px solid #e8e8e8; padding-bottom: 0.5em; }
+.msg { border-bottom: 1px solid #e8e8e8; padding: 10px 0; }
+.reply { padding: 6px 0 6px 28px; border-left: 3px solid #e0e0e0; margin-left: 16px; margin-top: 4px; }
+.thread { margin-top: 4px; }
+.msg-row { display: flex; align-items: flex-start; gap: 10px; }
+.msg-content { flex: 1; min-width: 0; }
+.msg-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0; }
+.avatar { border-radius: 4px; flex-shrink: 0; margin-top: 2px; }
+.author, a.author { font-weight: 700; color: #1d1c1d; text-decoration: none; }
+a.author:hover { text-decoration: underline; color: #1264a3; }
+.time, a.time { color: #ababad; font-size: 0.82em; margin-left: 8px; text-decoration: none; font-weight: 400; }
+a.time:hover { text-decoration: underline; color: #1264a3; }
+.reply-badge { font-size: 0.78em; color: #1264a3; background: #e8f5fe; padding: 1px 7px;
+  border-radius: 10px; margin-left: 8px; }
+.text { margin-top: 4px; white-space: pre-wrap; word-wrap: break-word; }
+.mention, a.mention { color: #1264a3; background: #e8f5fe; padding: 1px 4px; border-radius: 3px;
+  text-decoration: none; font-weight: 500; }
+a.mention:hover { text-decoration: underline; }
+.link { color: #1264a3; text-decoration: underline; }
+.link:hover { color: #0b4c8c; }
+.code-block { background: #f8f8f8; border: 1px solid #e1e1e1; border-radius: 6px; padding: 12px;
+  overflow-x: auto; font-family: 'Monaco', 'Menlo', 'Consolas', monospace; font-size: 0.88em;
+  line-height: 1.45; margin: 6px 0; white-space: pre; }
+.code-lang { font-size: 0.75em; color: #888; background: #f0f0f0; padding: 1px 6px;
+  border-radius: 3px; display: inline-block; margin-bottom: 4px; }
+.inline-code { background: #f0f0f0; border: 1px solid #e1e1e1; border-radius: 3px; padding: 1px 4px;
+  font-family: 'Monaco', 'Menlo', 'Consolas', monospace; font-size: 0.88em; color: #e01e5a; }
+.hl-kw { color: #d73a49; font-weight: 600; }
+.hl-str { color: #032f62; }
+.hl-cmt { color: #6a737d; font-style: italic; }
+.hl-num { color: #005cc5; }
+.file-img { margin: 8px 0; }
+.file-img img { max-width: 480px; max-height: 360px; border-radius: 6px; border: 1px solid #e1e1e1; }
+.file-attach { margin: 4px 0; font-size: 0.92em; }
+.file-attach a { color: #1264a3; text-decoration: underline; }
+.file-media { margin: 8px 0; }
+.file-media video, .file-media audio { max-width: 480px; border-radius: 6px; }
+.reactions { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
+.reaction { background: #f0f0f0; border: 1px solid #e1e1e1; border-radius: 12px; padding: 2px 8px;
+  font-size: 0.85em; display: inline-flex; align-items: center; gap: 4px; }
+.link-preview { border-left: 4px solid #e0e0e0; padding: 8px 12px; margin: 6px 0;
+  background: #fafafa; border-radius: 0 6px 6px 0; max-width: 500px; }
+.lp-title { font-weight: 600; font-size: 0.92em; color: #1264a3; }
+.lp-desc { font-size: 0.85em; color: #616061; margin-top: 2px; }
+.lp-img { max-width: 200px; max-height: 120px; border-radius: 4px; margin-top: 4px; }
+.export-footer { margin-top: 2em; padding: 1em 0; border-top: 1px solid #e8e8e8;
+  color: #ababad; font-size: 0.82em; text-align: center; }
+"""
     print("<!DOCTYPE html><html><head><meta charset='utf-8'>")
-    print(f"<title>#{ch_name}</title>")
-    print("<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:800px;margin:2em auto;padding:0 1em;line-height:1.6;color:#1d1c1d;}")
-    print(".msg{border-bottom:1px solid #e8e8e8;padding:8px 0;}.author{font-weight:700;}.time{color:#616061;font-size:0.85em;margin-left:8px;}.text{margin-top:4px;white-space:pre-wrap;}</style></head>")
-    print(f"<body><h1>#{ch_name}</h1>")
+    print(f"<title>#{html_mod.escape(ch_name)}</title>")
+    print(f"<style>{CSS}</style></head>")
+    print(f'<body><h1>#{html_mod.escape(ch_name)}</h1>')
+
+    # Group into threads: parents and replies
+    parents = []
+    threads = {}  # thread_ts -> [replies]
     for r in rows:
         ts = r.get("ts", "")
-        try:
-            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-        except:
-            dt = ts
-        author = r.get("author", "unknown")
-        text = prettify_text(r.get("text", "") or r.get("TXT", "") or "")
-        # Escape HTML
-        import html
-        text_html = html.escape(text).replace("\n", "<br>")
-        print(f'<div class="msg"><span class="author">{html.escape(author)}</span><span class="time">{dt}</span><div class="text">{text_html}</div></div>')
+        tts = r.get("thread_ts")
+        if not tts or tts == ts:
+            parents.append(r)
+        else:
+            threads.setdefault(tts, []).append(r)
+
+    for r in parents:
+        ts = r.get("ts", "")
+        out = render_message(r, is_reply=False)
+        replies = threads.get(ts, [])
+        if replies:
+            out += '<div class="thread">'
+            for reply in replies:
+                out += render_message(reply, is_reply=True) + '</div>'
+            out += '</div>'
+        out += '</div>'
+        print(out)
+
+    export_time = datetime.now().strftime("%B %d, %Y at %H:%M")
+    print(f'<footer class="export-footer">Exported with slackslaw on {html_mod.escape(export_time)}</footer>')
     print("</body></html>")
 else:
-    # Markdown
+    # Markdown (unchanged)
     print(f"## #{ch_name}\n")
     for r in rows:
         ts = r.get("ts", "")
         try:
             dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-        except:
+        except Exception:
             dt = ts
         author = r.get("author", "unknown")
         text = prettify_text(r.get("text", "") or r.get("TXT", "") or "")
         print(f"**{author}** ({dt}):\n{text}\n\n---\n")
+    export_time = datetime.now().strftime("%B %d, %Y at %H:%M")
+    print(f"\n---\n\n*Exported with slackslaw on {export_time}*\n")
 PYEOF
     done <<< "$workspaces"
   } | output_func
