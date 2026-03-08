@@ -120,6 +120,52 @@ json.dump(d,open(path,'w'),indent=2)
 PYEOF
 }
 
+# Parse relative duration (e.g. "7d", "24h", "30m") to unix timestamp (now - duration)
+parse_duration_to_ts() {
+  local input="$1"
+  local num="${input%[dhm]}" unit="${input: -1}"
+  local secs
+  case "$unit" in
+    d) secs=$((num * 86400)) ;;
+    h) secs=$((num * 3600)) ;;
+    m) secs=$((num * 60)) ;;
+    *) die "Invalid duration: $input (use e.g. 7d, 24h, 30m)" ;;
+  esac
+  python3 -c "import time; print(int(time.time()) - $secs)"
+}
+
+# Parse a date or duration string to a unix timestamp
+# Accepts: "7d", "24h", "30m" (relative) or "2024-01-15" (absolute date)
+parse_date_to_ts() {
+  local input="$1"
+  if [[ "$input" =~ ^[0-9]+[dhm]$ ]]; then
+    parse_duration_to_ts "$input"
+  elif [[ "$input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    python3 -c "
+import datetime, sys
+dt = datetime.datetime.strptime('$input', '%Y-%m-%d')
+print(int(dt.replace(tzinfo=datetime.timezone.utc).timestamp()))
+"
+  else
+    die "Invalid date/duration: $input (use e.g. 7d, 2024-01-15)"
+  fi
+}
+
+json_remove_from_array() {
+  python3 - "$1" "$2" "$3" <<'PYEOF' 2>/dev/null
+import json, sys
+path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    d = json.load(open(path))
+except:
+    d = {}
+arr = d.get(key, [])
+arr = [v for v in arr if v != val]
+d[key] = arr
+json.dump(d, open(path, "w"), indent=2)
+PYEOF
+}
+
 # ── "Mine" filter builder ─────────────────────────────────────────────────────
 
 # Build SQL clause for --mine filtering.
@@ -558,11 +604,17 @@ cmd_sync() {
 
   local full_sync=false
   local target_ws=""
+  local channel_spec=""
+  local since_duration=""
+  local quiet_mode=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --full)        full_sync=true ;;
       --workspace)   shift; target_ws="$1" ;;
+      --channel|-c)  shift; channel_spec="${1#\#}" ;;
+      --since)       shift; since_duration="$1" ;;
+      --quiet|-q)    quiet_mode=true ;;
       *)             warn "Unknown sync option: $1" ;;
     esac
     shift
@@ -576,9 +628,22 @@ cmd_sync() {
   fi
   [[ -z "$workspaces" ]] && die "No workspaces configured. Run: slackslaw auth first."
 
+  # Build time-from flag for --since
+  local time_from_flag=""
+  if [[ -n "$since_duration" ]]; then
+    local since_ts
+    since_ts=$(parse_duration_to_ts "$since_duration")
+    local since_rfc3339
+    since_rfc3339=$(python3 -c "
+from datetime import datetime, timezone
+print(datetime.fromtimestamp(${since_ts}, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))
+")
+    time_from_flag="-time-from ${since_rfc3339}"
+  fi
+
   while IFS= read -r ws; do
     [[ -z "$ws" ]] && continue
-    header "Syncing workspace: $ws"
+    $quiet_mode || header "Syncing workspace: $ws"
 
     local ws_dir
     ws_dir=$(workspace_dir "$ws")
@@ -591,32 +656,61 @@ cmd_sync() {
     local sync_start
     sync_start=$(date -u +%s)
 
+    # Resolve channel name → ID if channel_spec is given
+    local channel_id=""
+    if [[ -n "$channel_spec" ]]; then
+      local db
+      db=$(find_workspace_db "$ws_dir")
+      if [[ -n "$db" && -f "$db" ]]; then
+        local ch_table
+        ch_table=$(probe_table "$db" CHANNEL channels)
+        channel_id=$(sqlite3 "$db" \
+          "SELECT ID FROM ${ch_table} WHERE LOWER(NAME)=LOWER('${channel_spec}') LIMIT 1;" \
+          2>/dev/null || true)
+      fi
+      if [[ -z "$channel_id" ]]; then
+        # Try using the spec directly as a channel ID
+        channel_id="$channel_spec"
+      fi
+    fi
+
+    # Build the slackdump command
+    local output_redirect
+    if $quiet_mode; then
+      output_redirect=">> $LOG_FILE 2>&1"
+    else
+      output_redirect="2>&1 | tee -a $LOG_FILE"
+    fi
+
     if $full_sync || [[ -z "$last_sync" ]]; then
-      info "Full archive sync for ${ws}…"
+      $quiet_mode || info "Full archive sync for ${ws}…"
       # ─────────────────────────────────────────────────────────────────────
       # slackdump v4: -workspace and -y are per-subcommand flags.
       # They go AFTER the subcommand name, not before it.
       #   slackdump archive -workspace <ws> -y -o <dir>   ← correct (v4)
       #   slackdump -w <ws> archive ...                   ← wrong (causes "flag not defined")
       # ─────────────────────────────────────────────────────────────────────
-      slackdump archive -workspace "$ws" -y -o "$ws_dir" \
-        2>&1 | tee -a "$LOG_FILE" || {
-          error "slackdump archive failed for '$ws'"
-          error "Debug: try running manually:"
-          error "  slackdump archive -workspace $ws -y -o $ws_dir"
+      local cmd="slackdump archive -workspace \"$ws\" -y -o \"$ws_dir\""
+      [[ -n "$time_from_flag" ]] && cmd+=" $time_from_flag"
+      [[ -n "$channel_id" ]] && cmd+=" \"$channel_id\""
+      eval "$cmd $output_redirect" || {
+          $quiet_mode || error "slackdump archive failed for '$ws'"
+          $quiet_mode || error "Debug: try running manually:"
+          $quiet_mode || error "  slackdump archive -workspace $ws -y -o $ws_dir"
           continue
         }
     else
-      info "Incremental sync for ${ws} (since ${last_sync})…"
-      # `resume` picks up from the checkpoint stored inside ws_dir.
-      # Falls back to a full archive if resume fails (e.g. first run after
-      # upgrading slackdump or corrupted state).
-      slackdump resume -workspace "$ws" -y "$ws_dir" \
-        2>&1 | tee -a "$LOG_FILE" || {
-          warn "resume failed for '$ws' — falling back to full archive…"
-          slackdump archive -workspace "$ws" -y -o "$ws_dir" \
-            2>&1 | tee -a "$LOG_FILE" || {
-              error "archive also failed for '$ws'"
+      $quiet_mode || info "Incremental sync for ${ws} (since ${last_sync})…"
+      local cmd="slackdump resume -workspace \"$ws\" -y \"$ws_dir\""
+      [[ -n "$time_from_flag" ]] && cmd+=" $time_from_flag"
+      [[ -n "$channel_id" ]] && cmd+=" \"$channel_id\""
+      eval "$cmd $output_redirect" || {
+          $quiet_mode || warn "resume failed for '$ws' — falling back to full archive…"
+          local cmd2="slackdump archive -workspace \"$ws\" -y -o \"$ws_dir\""
+          [[ -n "$time_from_flag" ]] && cmd2+=" $time_from_flag"
+          [[ -n "$channel_id" ]] && cmd2+=" \"$channel_id\""
+          eval "$cmd2 $output_redirect" || {
+              $quiet_mode || error "archive also failed for '$ws'"
               continue
             }
         }
@@ -635,7 +729,15 @@ cmd_sync() {
     json_set "$STATE_FILE" "${ws}_last_sync_ts"       "$sync_start"
     json_set "$STATE_FILE" "${ws}_count_at_last_sync" "$prev_count"
 
-    info "Sync complete for ${ws}."
+    # In quiet mode, report new message count to stderr
+    if $quiet_mode; then
+      local old_count
+      old_count=$(json_get "$STATE_FILE" "${ws}_count_at_last_sync")
+      local new_msgs=$(( prev_count - ${old_count:-0} ))
+      (( new_msgs > 0 )) && echo "${ws}: ${new_msgs} new messages" >&2
+    else
+      info "Sync complete for ${ws}."
+    fi
   done <<< "$workspaces"
 }
 
@@ -878,6 +980,8 @@ cmd_search() {
   local limit=20
   local mine_filter=false
   local sort_order="ASC"
+  local after_ts="" before_ts=""
+  local format_mode="default"
 
   if [[ $# -gt 0 && "${1:0:1}" != "-" ]]; then
     query="$1"; shift
@@ -892,6 +996,9 @@ cmd_search() {
       --limit|-l)        shift; limit="$1" ;;
       --mine|-m)         mine_filter=true ;;
       --newest-first)    sort_order="DESC" ;;
+      --after)           shift; after_ts=$(parse_date_to_ts "$1") ;;
+      --before)          shift; before_ts=$(parse_date_to_ts "$1") ;;
+      --format)          shift; format_mode="$1" ;;
       *)                 warn "Unknown search option: $1" ;;
     esac
     shift
@@ -1001,6 +1108,9 @@ WHERE m.${text_col} LIKE '%${q_escaped}%'"
       [[ -n "$mine_clause" ]] && sql+=" AND ${mine_clause}"
     fi
 
+    [[ -n "$after_ts" ]] && sql+=" AND CAST(m.ts AS REAL) > ${after_ts}"
+    [[ -n "$before_ts" ]] && sql+=" AND CAST(m.ts AS REAL) < ${before_ts}"
+
     sql+=" GROUP BY m.TS, m.CHANNEL_ID ORDER BY CAST(m.ts AS REAL) ${sort_order} LIMIT ${limit};"
 
     local rows_json
@@ -1016,6 +1126,23 @@ for r in rows:
         r['datetime']=datetime.datetime.fromtimestamp(float(r.get('ts') or r.get('TS','')),tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     except: pass
     print(json.dumps(r))
+"
+      elif [[ "$format_mode" == "slack" ]]; then
+        # Raw Slack mrkdwn output — skip prettify
+        echo "$rows_json" | python3 -c "
+import json, sys
+from datetime import datetime, timezone
+rows = json.loads(sys.stdin.read())
+for r in rows:
+    ts = r.get('ts', '') or r.get('TS', '')
+    try:
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+    except:
+        dt = ts
+    author = r.get('author', 'unknown')
+    ch = r.get('channel', '')
+    text = r.get('text_snippet', '') or r.get('full_text', '') or r.get('TXT', '') or ''
+    print(f'{dt}  #{ch}  {author}  {text}')
 "
       else
         echo -e "\n${BOLD}${CYAN}Workspace: ${ws}${RESET}"
@@ -1166,6 +1293,341 @@ cmd_doctor() {
   if command -v slackdump >/dev/null 2>&1; then
     echo ""
     slackdump --version 2>/dev/null || slackdump version 2>/dev/null || true
+  fi
+}
+
+cmd_stats() {
+  ensure_sqlite3
+  init_dirs
+
+  local workspaces
+  workspaces=$(list_configured_workspaces)
+  [[ -z "$workspaces" ]] && die "No workspaces configured. Run: slackslaw auth"
+
+  while IFS= read -r ws; do
+    [[ -z "$ws" ]] && continue
+    local ws_dir db
+    ws_dir=$(workspace_dir "$ws")
+    db=$(find_workspace_db "$ws_dir")
+    [[ -z "$db" || ! -f "$db" ]] && continue
+
+    local msg_table user_table ch_table
+    msg_table=$(probe_table  "$db" MESSAGE messages message)
+    user_table=$(probe_table "$db" S_USER users user)
+    ch_table=$(probe_table   "$db" CHANNEL channels)
+
+    local text_col user_expr
+    text_col=$(probe_text_col "$db" "$msg_table")
+    user_expr=$(probe_user_expr "$db" "$msg_table")
+
+    local user_cols
+    user_cols=$(sqlite3 "$db" "PRAGMA table_info(${user_table});" 2>/dev/null || true)
+    local user_name_expr
+    if echo "$user_cols" | grep -qi '|USERNAME|'; then
+      user_name_expr="COALESCE(u.USERNAME, ${user_expr}, 'unknown')"
+    else
+      user_name_expr="COALESCE(u.real_name, u.name, ${user_expr}, 'unknown')"
+    fi
+    local user_dedup
+    if echo "$user_cols" | grep -qi '|USERNAME|'; then
+      user_dedup="(SELECT ID, USERNAME FROM ${user_table} GROUP BY ID)"
+    else
+      user_dedup="(SELECT ID, real_name, name FROM ${user_table} GROUP BY ID)"
+    fi
+    local ch_dedup="(SELECT ID, NAME FROM ${ch_table} GROUP BY ID)"
+
+    header "Stats: ${ws}"
+
+    # Totals
+    local msg_count ch_count user_count
+    msg_count=$(sqlite3 "$db" "SELECT COUNT(*) FROM ${msg_table};" 2>/dev/null || echo "0")
+    ch_count=$(sqlite3 "$db" "SELECT COUNT(DISTINCT ID) FROM ${ch_table};" 2>/dev/null || echo "0")
+    user_count=$(sqlite3 "$db" "SELECT COUNT(DISTINCT ID) FROM ${user_table};" 2>/dev/null || echo "0")
+    local date_range
+    date_range=$(sqlite3 "$db" "
+      SELECT MIN(datetime(CAST(ts AS REAL), 'unixepoch')) || ' → ' || MAX(datetime(CAST(ts AS REAL), 'unixepoch'))
+      FROM ${msg_table} WHERE ts IS NOT NULL;" 2>/dev/null || echo "?")
+
+    echo -e "  Total messages : ${BOLD}${msg_count}${RESET}"
+    echo -e "  Channels       : ${ch_count}"
+    echo -e "  Users          : ${user_count}"
+    echo -e "  Date range     : ${date_range}"
+
+    # Top 10 senders
+    echo -e "\n  ${BOLD}Top 10 Message Senders${RESET}"
+    sqlite3 "$db" "
+      SELECT ${user_name_expr} AS author, COUNT(*) AS cnt
+      FROM ${msg_table} m
+      LEFT JOIN ${user_dedup} u ON u.ID = ${user_expr}
+      WHERE m.${text_col} IS NOT NULL AND m.${text_col} != ''
+      GROUP BY ${user_expr}
+      ORDER BY cnt DESC
+      LIMIT 10;
+    " 2>/dev/null | while IFS='|' read -r author cnt; do
+      printf "    ${GREEN}%-20s${RESET} %s messages\n" "$author" "$cnt"
+    done
+
+    # Top 10 busiest channels
+    echo -e "\n  ${BOLD}Top 10 Busiest Channels${RESET}"
+    sqlite3 "$db" "
+      SELECT COALESCE(c.NAME, m.CHANNEL_ID) AS channel, COUNT(*) AS cnt
+      FROM ${msg_table} m
+      LEFT JOIN ${ch_dedup} c ON c.ID = m.CHANNEL_ID
+      WHERE m.${text_col} IS NOT NULL AND m.${text_col} != ''
+      GROUP BY m.CHANNEL_ID
+      ORDER BY cnt DESC
+      LIMIT 10;
+    " 2>/dev/null | while IFS='|' read -r channel cnt; do
+      printf "    ${CYAN}#%-20s${RESET} %s messages\n" "$channel" "$cnt"
+    done
+
+    # Most active hours
+    echo -e "\n  ${BOLD}Most Active Hours (UTC)${RESET}"
+    python3 - "$db" "$msg_table" <<'PYEOF'
+import sqlite3, sys
+db_path, msg_table = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(db_path)
+rows = conn.execute(f"""
+    SELECT CAST(strftime('%H', datetime(CAST(ts AS REAL), 'unixepoch')) AS INTEGER) AS hour, COUNT(*) AS cnt
+    FROM {msg_table}
+    WHERE ts IS NOT NULL
+    GROUP BY hour
+    ORDER BY hour;
+""").fetchall()
+conn.close()
+if not rows:
+    sys.exit(0)
+max_cnt = max(r[1] for r in rows)
+for hour, cnt in rows:
+    bar_len = int(cnt / max_cnt * 30) if max_cnt > 0 else 0
+    bar = '█' * bar_len
+    print(f"    {hour:02d}:00  {bar} {cnt}")
+PYEOF
+
+  done <<< "$workspaces"
+}
+
+cmd_threads() {
+  ensure_sqlite3
+  init_dirs
+
+  local url="${1:-}"
+  shift 2>/dev/null || true
+
+  local as_json=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) as_json=true ;;
+      *)      warn "Unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$url" ]] && die "Usage: slackslaw threads <slack-url> [--json]
+  Example: slackslaw threads https://myteam.slack.com/archives/C0123ABC/p1234567890123456"
+
+  # Parse URL: https://workspace.slack.com/archives/CXXX/pTTTTTTTTTTTTTTTT
+  local channel_id thread_ts
+  if [[ "$url" =~ /archives/([A-Z0-9]+)/p([0-9]+) ]]; then
+    channel_id="${BASH_REMATCH[1]}"
+    local raw_ts="${BASH_REMATCH[2]}"
+    # Convert p-prefixed timestamp: insert '.' before last 6 digits
+    local len=${#raw_ts}
+    if (( len > 6 )); then
+      thread_ts="${raw_ts:0:len-6}.${raw_ts:len-6}"
+    else
+      thread_ts="$raw_ts"
+    fi
+  else
+    die "Could not parse Slack URL: $url
+  Expected format: https://workspace.slack.com/archives/CXXX/pTTTTTTTTTTTTTTTT"
+  fi
+
+  local workspaces
+  workspaces=$(list_configured_workspaces)
+  [[ -z "$workspaces" ]] && die "No workspaces configured."
+
+  local found=false
+
+  while IFS= read -r ws; do
+    [[ -z "$ws" ]] && continue
+    local ws_dir db
+    ws_dir=$(workspace_dir "$ws")
+    db=$(find_workspace_db "$ws_dir")
+    [[ -z "$db" || ! -f "$db" ]] && continue
+
+    local msg_table user_table ch_table
+    msg_table=$(probe_table  "$db" MESSAGE messages message)
+    user_table=$(probe_table "$db" S_USER users user)
+    ch_table=$(probe_table   "$db" CHANNEL channels)
+
+    local text_col user_expr
+    text_col=$(probe_text_col "$db" "$msg_table")
+    user_expr=$(probe_user_expr "$db" "$msg_table")
+
+    local user_cols user_name_expr
+    user_cols=$(sqlite3 "$db" "PRAGMA table_info(${user_table});" 2>/dev/null || true)
+    if echo "$user_cols" | grep -qi '|USERNAME|'; then
+      user_name_expr="COALESCE(u.USERNAME, ${user_expr}, 'unknown')"
+    else
+      user_name_expr="COALESCE(u.real_name, u.name, ${user_expr}, 'unknown')"
+    fi
+    local ch_dedup="(SELECT ID, NAME FROM ${ch_table} GROUP BY ID)"
+    local user_dedup
+    if echo "$user_cols" | grep -qi '|USERNAME|'; then
+      user_dedup="(SELECT ID, USERNAME FROM ${user_table} GROUP BY ID)"
+    else
+      user_dedup="(SELECT ID, real_name, name FROM ${user_table} GROUP BY ID)"
+    fi
+
+    # Check if this channel exists in this workspace
+    local ch_exists
+    ch_exists=$(sqlite3 "$db" "SELECT 1 FROM ${ch_table} WHERE ID='${channel_id}' LIMIT 1;" 2>/dev/null || true)
+    [[ -z "$ch_exists" ]] && continue
+
+    local sql="
+SELECT m.ts,
+  ${user_name_expr} AS author,
+  COALESCE(c.NAME, m.CHANNEL_ID, '') AS channel,
+  m.${text_col} AS text,
+  '${ws}' AS workspace,
+  m.CHANNEL_ID AS channel_id
+FROM ${msg_table} m
+LEFT JOIN ${ch_dedup} c ON c.ID = m.CHANNEL_ID
+LEFT JOIN ${user_dedup} u ON u.ID = ${user_expr}
+WHERE m.CHANNEL_ID = '${channel_id}'
+  AND (m.THREAD_TS = '${thread_ts}' OR m.TS = '${thread_ts}')
+ORDER BY CAST(m.ts AS REAL) ASC;"
+
+    local rows_json
+    rows_json=$(sqlite3 -json "$db" "$sql" 2>/dev/null || echo "[]")
+    if [[ "$rows_json" != "[]" && -n "$rows_json" ]]; then
+      found=true
+      if $as_json; then
+        echo "$rows_json" | python3 -c "
+import json,sys,datetime
+rows=json.load(sys.stdin)
+for r in rows:
+    try:
+        r['datetime']=datetime.datetime.fromtimestamp(float(r.get('ts') or r.get('TS','')),tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    except: pass
+    print(json.dumps(r))
+"
+      else
+        header "Thread in #$(sqlite3 "$db" "SELECT NAME FROM ${ch_table} WHERE ID='${channel_id}' LIMIT 1;" 2>/dev/null || echo "$channel_id") (${ws})"
+        format_rows "$db" "$user_table" "detail" "$rows_json"
+      fi
+    fi
+  done <<< "$workspaces"
+
+  if ! $found; then
+    if $as_json; then echo "[]"; else info "Thread not found in any workspace."; fi
+  fi
+}
+
+cmd_gc() {
+  ensure_sqlite3
+  init_dirs
+
+  local workspaces
+  workspaces=$(list_configured_workspaces)
+  [[ -z "$workspaces" ]] && die "No workspaces configured."
+
+  header "Garbage Collection"
+
+  while IFS= read -r ws; do
+    [[ -z "$ws" ]] && continue
+    local ws_dir db
+    ws_dir=$(workspace_dir "$ws")
+    db=$(find_workspace_db "$ws_dir")
+    [[ -z "$db" || ! -f "$db" ]] && continue
+
+    local size_before size_after
+    size_before=$(du -sh "$db" 2>/dev/null | cut -f1)
+
+    info "Vacuuming ${ws} (${size_before})…"
+    sqlite3 "$db" "VACUUM;" 2>/dev/null || { warn "VACUUM failed for ${ws}"; continue; }
+
+    size_after=$(du -sh "$db" 2>/dev/null | cut -f1)
+    echo -e "  ${ws}: ${size_before} → ${size_after}"
+
+    # Clean up orphaned WAL/SHM files
+    for ext in -wal -shm; do
+      if [[ -f "${db}${ext}" ]]; then
+        rm -f "${db}${ext}"
+        echo -e "  ${DIM}Removed orphaned ${db}${ext}${RESET}"
+      fi
+    done
+  done <<< "$workspaces"
+
+  info "Done."
+}
+
+cmd_repair() {
+  ensure_sqlite3
+  init_dirs
+
+  local workspaces
+  workspaces=$(list_configured_workspaces)
+  [[ -z "$workspaces" ]] && die "No workspaces configured."
+
+  header "Database Integrity Check"
+
+  while IFS= read -r ws; do
+    [[ -z "$ws" ]] && continue
+    local ws_dir db
+    ws_dir=$(workspace_dir "$ws")
+    db=$(find_workspace_db "$ws_dir")
+    [[ -z "$db" || ! -f "$db" ]] && continue
+
+    local result
+    result=$(sqlite3 "$db" "PRAGMA integrity_check;" 2>/dev/null || echo "error")
+
+    if [[ "$result" == "ok" ]]; then
+      echo -e "  ${GREEN}✓${RESET} ${ws}: database OK"
+    else
+      echo -e "  ${RED}✗${RESET} ${ws}: integrity check failed"
+      echo -e "    ${DIM}${result}${RESET}"
+      warn "Re-run a full sync to rebuild: slackslaw sync --full --workspace ${ws}"
+    fi
+  done <<< "$workspaces"
+}
+
+cmd_workspaces_remove() {
+  init_dirs
+
+  local ws_name="${1:-}"
+  local delete_data=false
+
+  shift 2>/dev/null || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --delete-data) delete_data=true ;;
+      *)             warn "Unknown option: $1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$ws_name" ]] && die "Usage: slackslaw workspaces remove <name> [--delete-data]"
+
+  # Normalise
+  [[ "$ws_name" != *.slack.com ]] && ws_name="${ws_name}.slack.com"
+
+  # Check if it exists
+  local existing
+  existing=$(json_array_get "$CONFIG_FILE" "workspaces" | grep -Fx "$ws_name" || true)
+  [[ -z "$existing" ]] && die "Workspace '${ws_name}' not found in config."
+
+  json_remove_from_array "$CONFIG_FILE" "workspaces" "$ws_name"
+  info "Removed workspace '${ws_name}' from config."
+
+  if $delete_data; then
+    local ws_dir
+    ws_dir=$(workspace_dir "$ws_name")
+    if [[ -d "$ws_dir" ]]; then
+      rm -rf "$ws_dir"
+      info "Deleted archive directory: ${ws_dir}"
+    fi
   fi
 }
 

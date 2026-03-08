@@ -1,0 +1,20 @@
+# Backups
+*.bak
+*.bak2
+*.bak3
+
+# macOS
+.DS_Store
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# slackslaw data (never commit user data)
+.slackslaw/
+
+# Claude Code
+.claude/
