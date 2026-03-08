@@ -661,10 +661,10 @@ test_context() {
 
   run_slackslaw context --since 9999d
   assert_exit 0 "context exits 0"
-  assert_json_array "context outputs valid JSON array"
-  assert_contains "workspace" "context includes workspace"
-  assert_contains "channels" "context includes channels"
-  assert_contains "messages" "context includes messages"
+  assert_contains "## #general" "context includes general channel"
+  assert_contains "## #ops" "context includes ops channel"
+  assert_contains "Hello everyone" "context includes message text"
+  assert_contains "bob" "context includes author"
 }
 
 test_context_channel_filter() {
