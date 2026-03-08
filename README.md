@@ -1,5 +1,7 @@
 # slackslaw
 
+[![Tests](https://github.com/salam/slackslaw-cli/actions/workflows/test.yml/badge.svg)](https://github.com/salam/slackslaw-cli/actions/workflows/test.yml)
+
 A CLI for Slack that mirrors your workspaces into local SQLite for offline search, agent-friendly querying, and incremental sync. Powered by [slackdump](https://github.com/rusq/slackdump).
 
 ## Features

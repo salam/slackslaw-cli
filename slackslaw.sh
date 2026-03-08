@@ -8,16 +8,27 @@
 # Usage:
 #   slackslaw auth                          # add / re-auth a workspace
 #   slackslaw workspaces                    # list configured workspaces
+#   slackslaw workspaces remove <name>      # remove a workspace
 #   slackslaw sync --full                   # full archive of all workspaces
 #   slackslaw sync                          # incremental sync (new msgs only)
+#   slackslaw sync --channel "#ops"         # sync a single channel
+#   slackslaw sync --since 30d              # time-bounded sync
+#   slackslaw sync --quiet                  # cron-friendly (silent on success)
 #   slackslaw whatsnew                      # print msgs since last sync
 #   slackslaw whatsnew --json               # same, JSON output (one obj/line)
 #   slackslaw search "expr"                 # FTS search across all workspaces
-#   slackslaw search "expr" --workspace W   # limit to one workspace
-#   slackslaw search "expr" --channel "#c"  # limit to a channel
-#   slackslaw search "expr" --author user   # limit to a user
-#   slackslaw search "expr" --limit 50      # max results (default 20)
-#   slackslaw search "expr" --json          # JSON output (one obj/line)
+#   slackslaw search "expr" --after 7d      # only recent messages
+#   slackslaw search "expr" --before DATE   # only messages before date
+#   slackslaw search "expr" --format slack  # raw Slack mrkdwn output
+#   slackslaw threads <url>                 # dump a thread by Slack URL
+#   slackslaw stats                         # detailed archive statistics
+#   slackslaw export --channel "#general"   # export channel to markdown
+#   slackslaw tail -f                       # live-watch for new messages
+#   slackslaw context --since 7d            # LLM-ready JSON context
+#   slackslaw ask "question"                # RAG over the archive
+#   slackslaw mcp                           # start MCP server
+#   slackslaw gc                            # vacuum databases
+#   slackslaw repair                        # check DB integrity
 #   slackslaw sql 'SELECT ...'              # raw SQL against local DB(s)
 #   slackslaw status                        # archive stats per workspace
 #   slackslaw doctor                        # check dependencies & config
@@ -34,7 +45,7 @@
 #       slackdump archive -workspace <ws> -y -o <dir>   ← correct
 #       slackdump -workspace <ws> archive ...            ← WRONG (v4)
 #   - `archive -workspace <ws> -y -o <dir>` — full sync into <dir>
-#   - `resume -workspace <ws> -y <dir>`     — incremental from checkpoint
+#   - `resume -workspace <ws> <dir>`         — incremental from checkpoint
 #   - The .db file lives inside the output dir, discovered at runtime
 #
 # =============================================================================
@@ -346,6 +357,31 @@ for dt, pch, author, ptxt in parsed:
         if extra.strip():
             print(f"{' ' * indent}  {extra}")
 PYEOF
+}
+
+# Print rows in raw Slack mrkdwn format (no prettify).
+# Input: JSON array string as $1
+format_rows_slackmd() {
+  local json_data="$1"
+  python3 -c "
+import json, sys
+from datetime import datetime, timezone
+rows = json.loads(sys.argv[1])
+for r in rows:
+    ts = r.get('ts', '') or r.get('TS', '')
+    try:
+        dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+    except:
+        dt = ts
+    author = r.get('author', 'unknown')
+    ch = r.get('channel', '')
+    ws = r.get('workspace', '')
+    text = r.get('text', '') or r.get('text_snippet', '') or r.get('full_text', '') or r.get('TXT', '') or ''
+    prefix = f'#{ch}' if ch else ''
+    if ws:
+        prefix = f'{ws}  {prefix}' if prefix else ws
+    print(f'{dt}  {prefix}  {author}  {text}')
+" "$json_data"
 }
 
 # ── Installation ──────────────────────────────────────────────────────────────
@@ -701,7 +737,7 @@ print(datetime.fromtimestamp(${since_ts}, tz=timezone.utc).strftime('%Y-%m-%dT%H
         }
     else
       $quiet_mode || info "Incremental sync for ${ws} (since ${last_sync})…"
-      local cmd="slackdump resume -workspace \"$ws\" -y \"$ws_dir\""
+      local cmd="slackdump resume -workspace \"$ws\" \"$ws_dir\""
       [[ -n "$time_from_flag" ]] && cmd+=" $time_from_flag"
       [[ -n "$channel_id" ]] && cmd+=" \"$channel_id\""
       eval "$cmd $output_redirect" || {
@@ -749,10 +785,17 @@ cmd_whatsnew() {
   local target_ws=""
   local limit=100
   local mine_filter=false
+  local format_mode="default"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json)        as_json=true ;;
+      --slackmd)     format_mode="slackmd" ;;
+      --format)      shift;
+                     case "$1" in
+                       json)    as_json=true ;;
+                       slackmd) format_mode="slackmd" ;;
+                     esac ;;
       --workspace)   shift; target_ws="$1" ;;
       --limit)       shift; limit="$1" ;;
       --mine|-m)     mine_filter=true ;;
@@ -850,6 +893,8 @@ for r in rows:
     except: pass
     print(json.dumps(r))
 "
+      elif [[ "$format_mode" == "slackmd" ]]; then
+        format_rows_slackmd "$rows_json"
       else
         echo -e "\n${BOLD}${CYAN}Workspace: ${ws}${RESET}"
         format_rows "$db" "$user_table" "list" "$rows_json"
@@ -869,10 +914,17 @@ cmd_unread() {
   local as_json=false
   local target_ws=""
   local limit=100
+  local format_mode="default"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json)        as_json=true ;;
+      --slackmd)     format_mode="slackmd" ;;
+      --format)      shift;
+                     case "$1" in
+                       json)    as_json=true ;;
+                       slackmd) format_mode="slackmd" ;;
+                     esac ;;
       --workspace)   shift; target_ws="$1" ;;
       --limit)       shift; limit="$1" ;;
       *)             warn "Unknown option: $1" ;;
@@ -956,6 +1008,8 @@ for r in rows:
     except: pass
     print(json.dumps(r))
 "
+      elif [[ "$format_mode" == "slackmd" ]]; then
+        format_rows_slackmd "$rows_json"
       else
         echo -e "\n${BOLD}${CYAN}Workspace: ${ws}${RESET}"
         format_rows "$db" "$user_table" "detail" "$rows_json"
@@ -990,6 +1044,7 @@ cmd_search() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json)            as_json=true ;;
+      --slackmd)         format_mode="slackmd" ;;
       --workspace|-w)    shift; target_ws="$1" ;;
       --channel|-c)      shift; channel_filter="${1#\#}" ;;
       --author|-a)       shift; author_filter="$1" ;;
@@ -998,7 +1053,12 @@ cmd_search() {
       --newest-first)    sort_order="DESC" ;;
       --after)           shift; after_ts=$(parse_date_to_ts "$1") ;;
       --before)          shift; before_ts=$(parse_date_to_ts "$1") ;;
-      --format)          shift; format_mode="$1" ;;
+      --format)          shift;
+                         case "$1" in
+                           json)    as_json=true ;;
+                           slackmd) format_mode="slackmd" ;;
+                           *)       format_mode="$1" ;;
+                         esac ;;
       *)                 warn "Unknown search option: $1" ;;
     esac
     shift
@@ -1016,6 +1076,9 @@ cmd_search() {
   [[ -z "$workspaces" ]] && die "No workspaces configured. Run: slackslaw auth"
 
   local any_results=false
+  # Collect all results across workspaces for unified sorting
+  local all_results_json="[]"
+  local last_db="" last_user_table=""
 
   while IFS= read -r ws; do
     [[ -z "$ws" ]] && continue
@@ -1117,8 +1180,37 @@ WHERE m.${text_col} LIKE '%${q_escaped}%'"
     rows_json=$(sqlite3 -json "$db" "$sql" 2>/dev/null || echo "[]")
     if [[ "$rows_json" != "[]" && -n "$rows_json" ]]; then
       any_results=true
-      if $as_json; then
-        echo "$rows_json" | python3 -c "
+      last_db="$db"
+      last_user_table="$user_table"
+      # Merge results for cross-workspace unified sorting
+      all_results_json=$(python3 -c "
+import json, sys
+existing = json.loads(sys.argv[1])
+new = json.loads(sys.argv[2])
+print(json.dumps(existing + new))
+" "$all_results_json" "$rows_json")
+    fi
+
+  done <<< "$workspaces"
+
+  if ! $any_results; then
+    if $as_json; then echo "[]"; else info "No results for: ${query}"; fi
+    return
+  fi
+
+  # Sort all results globally by timestamp and apply limit
+  local sorted_json
+  sorted_json=$(python3 -c "
+import json, sys
+rows = json.loads(sys.argv[1])
+reverse = sys.argv[2] == 'DESC'
+limit = int(sys.argv[3])
+rows.sort(key=lambda r: float(r.get('ts', 0) or r.get('TS', 0) or 0), reverse=reverse)
+print(json.dumps(rows[:limit]))
+" "$all_results_json" "$sort_order" "$limit")
+
+  if $as_json; then
+    echo "$sorted_json" | python3 -c "
 import json,sys,datetime
 rows=json.load(sys.stdin)
 for r in rows:
@@ -1127,9 +1219,8 @@ for r in rows:
     except: pass
     print(json.dumps(r))
 "
-      elif [[ "$format_mode" == "slack" ]]; then
-        # Raw Slack mrkdwn output — skip prettify
-        echo "$rows_json" | python3 -c "
+  elif [[ "$format_mode" == "slackmd" ]]; then
+    echo "$sorted_json" | python3 -c "
 import json, sys
 from datetime import datetime, timezone
 rows = json.loads(sys.stdin.read())
@@ -1141,19 +1232,12 @@ for r in rows:
         dt = ts
     author = r.get('author', 'unknown')
     ch = r.get('channel', '')
+    ws = r.get('workspace', '')
     text = r.get('text_snippet', '') or r.get('full_text', '') or r.get('TXT', '') or ''
     print(f'{dt}  #{ch}  {author}  {text}')
 "
-      else
-        echo -e "\n${BOLD}${CYAN}Workspace: ${ws}${RESET}"
-        format_rows "$db" "$user_table" "detail" "$rows_json"
-      fi
-    fi
-
-  done <<< "$workspaces"
-
-  if ! $any_results; then
-    if $as_json; then echo "[]"; else info "No results for: ${query}"; fi
+  else
+    format_rows "$last_db" "$last_user_table" "detail" "$sorted_json"
   fi
 }
 
@@ -1415,10 +1499,17 @@ cmd_threads() {
   shift 2>/dev/null || true
 
   local as_json=false
+  local format_mode="default"
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --json) as_json=true ;;
-      *)      warn "Unknown option: $1" ;;
+      --json)   as_json=true ;;
+      --slackmd) format_mode="slackmd" ;;
+      --format) shift;
+                case "$1" in
+                  json)    as_json=true ;;
+                  slackmd) format_mode="slackmd" ;;
+                esac ;;
+      *)        warn "Unknown option: $1" ;;
     esac
     shift
   done
@@ -1513,6 +1604,8 @@ for r in rows:
     except: pass
     print(json.dumps(r))
 "
+      elif [[ "$format_mode" == "slackmd" ]]; then
+        format_rows_slackmd "$rows_json"
       else
         header "Thread in #$(sqlite3 "$db" "SELECT NAME FROM ${ch_table} WHERE ID='${channel_id}' LIMIT 1;" 2>/dev/null || echo "$channel_id") (${ws})"
         format_rows "$db" "$user_table" "detail" "$rows_json"
@@ -1523,6 +1616,585 @@ for r in rows:
   if ! $found; then
     if $as_json; then echo "[]"; else info "Thread not found in any workspace."; fi
   fi
+}
+
+cmd_tail() {
+  ensure_slackdump
+  ensure_sqlite3
+  init_dirs
+
+  local interval=30
+  local as_json=false
+  local mine_filter=false
+  local channel_filter=""
+  local target_ws=""
+  local format_mode="default"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -f|--follow)   ;; # accepted for familiar `tail -f` usage
+      --interval)    shift; interval="$1" ;;
+      --json)        as_json=true ;;
+      --slackmd)     format_mode="slackmd" ;;
+      --format)      shift;
+                     case "$1" in
+                       json)    as_json=true ;;
+                       slackmd) format_mode="slackmd" ;;
+                     esac ;;
+      --mine|-m)     mine_filter=true ;;
+      --channel|-c)  shift; channel_filter="${1#\#}" ;;
+      --workspace|-w) shift; target_ws="$1" ;;
+      *)             warn "Unknown tail option: $1" ;;
+    esac
+    shift
+  done
+
+  local workspaces
+  if [[ -n "$target_ws" ]]; then
+    workspaces="$target_ws"
+  else
+    workspaces=$(list_configured_workspaces)
+  fi
+  [[ -z "$workspaces" ]] && die "No workspaces configured."
+
+  info "Watching for new messages (poll every ${interval}s, Ctrl-C to stop)…"
+
+  # Track last seen timestamp per workspace (file-based for bash 3 compat)
+  local tail_state_dir
+  tail_state_dir=$(mktemp -d)
+  local init_ts
+  init_ts=$(date -u +%s)
+  while IFS= read -r ws; do
+    [[ -z "$ws" ]] && continue
+    echo "$init_ts" > "${tail_state_dir}/${ws}"
+  done <<< "$workspaces"
+
+  trap 'echo ""; rm -rf "$tail_state_dir"; info "Stopped."; exit 0' INT
+
+  while true; do
+    # Sync all workspaces
+    while IFS= read -r ws; do
+      [[ -z "$ws" ]] && continue
+      local ws_dir
+      ws_dir=$(workspace_dir "$ws")
+      [[ ! -d "$ws_dir" ]] && continue
+
+      # Incremental sync (quiet)
+      slackdump resume -workspace "$ws" "$ws_dir" >> "$LOG_FILE" 2>&1 || true
+
+      local db
+      db=$(find_workspace_db "$ws_dir")
+      [[ -z "$db" || ! -f "$db" ]] && continue
+
+      local msg_table user_table ch_table
+      msg_table=$(probe_table  "$db" MESSAGE messages message)
+      user_table=$(probe_table "$db" S_USER users user)
+      ch_table=$(probe_table   "$db" CHANNEL channels)
+
+      local text_col user_expr
+      text_col=$(probe_text_col "$db" "$msg_table")
+      user_expr=$(probe_user_expr "$db" "$msg_table")
+
+      local user_cols user_name_expr
+      user_cols=$(sqlite3 "$db" "PRAGMA table_info(${user_table});" 2>/dev/null || true)
+      if echo "$user_cols" | grep -qi '|USERNAME|'; then
+        user_name_expr="COALESCE(u.USERNAME, ${user_expr}, 'unknown')"
+      else
+        user_name_expr="COALESCE(u.real_name, u.name, ${user_expr}, 'unknown')"
+      fi
+      local ch_dedup="(SELECT ID, NAME FROM ${ch_table} GROUP BY ID)"
+      local user_dedup
+      if echo "$user_cols" | grep -qi '|USERNAME|'; then
+        user_dedup="(SELECT ID, USERNAME FROM ${user_table} GROUP BY ID)"
+      else
+        user_dedup="(SELECT ID, real_name, name FROM ${user_table} GROUP BY ID)"
+      fi
+
+      local since
+      since=$(cat "${tail_state_dir}/${ws}" 2>/dev/null || echo "$init_ts")
+      local slack_ts
+      slack_ts=$(python3 -c "print('%.6f' % float('$since'))" 2>/dev/null || echo "0.000000")
+
+      local sql="
+SELECT m.ts,
+  ${user_name_expr} AS author,
+  COALESCE(c.NAME, m.CHANNEL_ID, '') AS channel,
+  m.${text_col} AS text,
+  '${ws}' AS workspace,
+  m.CHANNEL_ID AS channel_id
+FROM ${msg_table} m
+LEFT JOIN ${ch_dedup} c ON c.ID = m.CHANNEL_ID
+LEFT JOIN ${user_dedup} u ON u.ID = ${user_expr}
+WHERE CAST(m.ts AS REAL) > ${slack_ts}
+  AND (m.${text_col} IS NOT NULL AND m.${text_col} != '')"
+
+      [[ -n "$channel_filter" ]] && \
+        sql+=" AND LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}')"
+
+      if $mine_filter; then
+        local mine_clause
+        mine_clause=$(build_mine_clause "$db" "$msg_table" "$text_col" "$user_expr")
+        [[ -n "$mine_clause" ]] && sql+=" AND ${mine_clause}"
+      fi
+
+      sql+=" GROUP BY m.TS, m.CHANNEL_ID ORDER BY CAST(m.ts AS REAL) ASC;"
+
+      local rows_json
+      rows_json=$(sqlite3 -json "$db" "$sql" 2>/dev/null || echo "[]")
+      if [[ "$rows_json" != "[]" && -n "$rows_json" ]]; then
+        if $as_json; then
+          echo "$rows_json" | python3 -c "
+import json,sys,datetime
+rows=json.load(sys.stdin)
+for r in rows:
+    try:
+        r['datetime']=datetime.datetime.fromtimestamp(float(r.get('ts') or r.get('TS','')),tz=datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    except: pass
+    print(json.dumps(r))
+"
+        elif [[ "$format_mode" == "slackmd" ]]; then
+          format_rows_slackmd "$rows_json"
+        else
+          format_rows "$db" "$user_table" "detail" "$rows_json"
+        fi
+
+        # Update last_seen_ts to max ts in results
+        local max_ts
+        max_ts=$(echo "$rows_json" | python3 -c "
+import json, sys
+rows = json.load(sys.stdin)
+print(max(float(r.get('ts', 0) or r.get('TS', 0) or 0) for r in rows))
+" 2>/dev/null || echo "$since")
+        echo "$max_ts" > "${tail_state_dir}/${ws}"
+      fi
+    done <<< "$workspaces"
+
+    sleep "$interval"
+  done
+}
+
+cmd_context() {
+  ensure_sqlite3
+  init_dirs
+
+  local since_duration="7d"
+  local mine_filter=false
+  local channel_filter=""
+  local target_ws=""
+  local limit=1000
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)       shift; since_duration="$1" ;;
+      --mine|-m)     mine_filter=true ;;
+      --channel|-c)  shift; channel_filter="${1#\#}" ;;
+      --workspace|-w) shift; target_ws="$1" ;;
+      --limit|-l)    shift; limit="$1" ;;
+      *)             warn "Unknown context option: $1" ;;
+    esac
+    shift
+  done
+
+  local since_ts
+  since_ts=$(parse_duration_to_ts "$since_duration")
+
+  local workspaces
+  if [[ -n "$target_ws" ]]; then
+    workspaces="$target_ws"
+  else
+    workspaces=$(list_configured_workspaces)
+  fi
+  [[ -z "$workspaces" ]] && die "No workspaces configured."
+
+  # Build JSON output grouped by workspace and channel
+  python3 -c "
+import json, sqlite3, sys, re, os
+from datetime import datetime, timezone
+
+since_ts = float(sys.argv[1])
+limit = int(sys.argv[2])
+mine_filter = sys.argv[3] == 'true'
+channel_filter = sys.argv[4]
+workspaces_str = sys.argv[5]
+workspaces_dir = sys.argv[6]
+
+def prettify_text(text, user_map):
+    if not text:
+        return ''
+    def repl_mention(m):
+        return '@' + user_map.get(m.group(1), m.group(1))
+    text = re.sub(r'<@([A-Z0-9]+)(?:\|[^>]*)?>', repl_mention, text)
+    text = re.sub(r'<mailto:([^|>]+)\|([^>]+)>', r'\2', text)
+    text = re.sub(r'<(https?://[^|>]+)\|([^>]+)>', r'\2', text)
+    text = re.sub(r'<(https?://[^>]+)>', r'\1', text)
+    text = re.sub(r'<#[A-Z0-9]+\|([^>]+)>', r'#\1', text)
+    text = re.sub(r'<!([a-z]+)(?:\|[^>]*)?>', r'@\1', text)
+    return text
+
+result = []
+
+for ws in workspaces_str.strip().split('\n'):
+    ws = ws.strip()
+    if not ws:
+        continue
+    short = ws.replace('.slack.com', '')
+    ws_dir = os.path.join(workspaces_dir, short)
+    # Find DB
+    db_path = None
+    for root, dirs, files in os.walk(ws_dir):
+        for f in files:
+            if f.endswith('.db') or f.endswith('.sqlite'):
+                db_path = os.path.join(root, f)
+                break
+        if db_path:
+            break
+    if not db_path or not os.path.isfile(db_path):
+        continue
+
+    conn = sqlite3.connect(db_path)
+
+    # Probe tables
+    tables = [r[0] for r in conn.execute(\"\"\"SELECT name FROM sqlite_master WHERE type='table'\"\"\").fetchall()]
+    msg_table = 'MESSAGE' if 'MESSAGE' in tables else 'messages'
+    user_table = 'S_USER' if 'S_USER' in tables else 'users'
+    ch_table = 'CHANNEL' if 'CHANNEL' in tables else 'channels'
+
+    # Probe columns
+    cols = [r[1] for r in conn.execute(f'PRAGMA table_info({msg_table})').fetchall()]
+    text_col = 'TXT' if 'TXT' in cols else 'text'
+
+    user_cols = [r[1] for r in conn.execute(f'PRAGMA table_info({user_table})').fetchall()]
+    has_username = 'USERNAME' in user_cols
+
+    # Build user map
+    user_map = {}
+    try:
+        if has_username:
+            for r in conn.execute(f'SELECT ID, USERNAME FROM {user_table} GROUP BY ID'):
+                user_map[r[0]] = r[1]
+        else:
+            for r in conn.execute(f'SELECT ID, COALESCE(real_name, name) FROM {user_table} GROUP BY ID'):
+                user_map[r[0]] = r[1]
+    except:
+        pass
+
+    # Build channel map
+    ch_map = {}
+    try:
+        for r in conn.execute(f'SELECT ID, NAME FROM {ch_table} GROUP BY ID'):
+            ch_map[r[0]] = r[1] or r[0]
+    except:
+        pass
+
+    # Query messages
+    sql = f\"\"\"
+        SELECT m.ts, json_extract(m.DATA, '$.user') AS uid, m.CHANNEL_ID, m.{text_col}
+        FROM {msg_table} m
+        WHERE CAST(m.ts AS REAL) > {since_ts}
+          AND m.{text_col} IS NOT NULL AND m.{text_col} != ''
+    \"\"\"
+    if channel_filter:
+        sql += f\" AND m.CHANNEL_ID IN (SELECT ID FROM {ch_table} WHERE LOWER(NAME) = LOWER('{channel_filter}'))\"
+    sql += f' ORDER BY CAST(m.ts AS REAL) ASC LIMIT {limit}'
+
+    rows = conn.execute(sql).fetchall()
+    conn.close()
+
+    # Group by channel
+    channels = {}
+    for ts, uid, ch_id, text in rows:
+        ch_name = ch_map.get(ch_id, ch_id)
+        if ch_name not in channels:
+            channels[ch_name] = []
+        try:
+            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        except:
+            dt = str(ts)
+        channels[ch_name].append({
+            'author': user_map.get(uid, uid or 'unknown'),
+            'time': dt,
+            'text': prettify_text(text, user_map)
+        })
+
+    ws_data = {'workspace': ws, 'channels': []}
+    for ch_name, msgs in sorted(channels.items()):
+        ws_data['channels'].append({'name': '#' + ch_name, 'messages': msgs})
+    result.append(ws_data)
+
+print(json.dumps(result, indent=2))
+" "$since_ts" "$limit" "$mine_filter" "$channel_filter" "$workspaces" "$WORKSPACES_DIR"
+}
+
+cmd_ask() {
+  init_dirs
+
+  local question="${1:-}"
+  shift 2>/dev/null || true
+
+  local since="7d"
+  local provider="anthropic"
+  local target_ws=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)       shift; since="$1" ;;
+      --provider)    shift; provider="$1" ;;
+      --workspace|-w) shift; target_ws="$1" ;;
+      *)             warn "Unknown ask option: $1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$question" ]] && die "Usage: slackslaw ask \"question\" [--since 7d] [--provider anthropic|openai]"
+
+  # Get context
+  local context_args=(--since "$since")
+  [[ -n "$target_ws" ]] && context_args+=(--workspace "$target_ws")
+  local context
+  context=$(cmd_context "${context_args[@]}")
+
+  local system_prompt="You are a helpful assistant analyzing Slack messages. Below is a JSON dump of recent Slack conversations. Answer the user's question based on this context.
+
+Context:
+${context}"
+
+  if [[ "$provider" == "openai" ]]; then
+    [[ -z "${OPENAI_API_KEY:-}" ]] && die "OPENAI_API_KEY not set."
+    curl -sS https://api.openai.com/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+      -d "$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': 'gpt-4o',
+    'messages': [
+        {'role': 'system', 'content': sys.argv[1]},
+        {'role': 'user', 'content': sys.argv[2]}
+    ]
+}))
+" "$system_prompt" "$question")" | python3 -c "
+import json, sys
+resp = json.load(sys.stdin)
+if 'choices' in resp:
+    print(resp['choices'][0]['message']['content'])
+elif 'error' in resp:
+    print('Error: ' + resp['error'].get('message', str(resp['error'])), file=sys.stderr)
+    sys.exit(1)
+"
+  else
+    [[ -z "${ANTHROPIC_API_KEY:-}" ]] && die "ANTHROPIC_API_KEY not set."
+    curl -sS https://api.anthropic.com/v1/messages \
+      -H "Content-Type: application/json" \
+      -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+      -H "anthropic-version: 2023-06-01" \
+      -d "$(python3 -c "
+import json, sys
+print(json.dumps({
+    'model': 'claude-sonnet-4-20250514',
+    'max_tokens': 4096,
+    'system': sys.argv[1],
+    'messages': [
+        {'role': 'user', 'content': sys.argv[2]}
+    ]
+}))
+" "$system_prompt" "$question")" | python3 -c "
+import json, sys
+resp = json.load(sys.stdin)
+if 'content' in resp:
+    for block in resp['content']:
+        if block.get('type') == 'text':
+            print(block['text'])
+elif 'error' in resp:
+    print('Error: ' + resp['error'].get('message', str(resp['error'])), file=sys.stderr)
+    sys.exit(1)
+"
+  fi
+}
+
+cmd_mcp() {
+  ensure_slackdump
+  init_dirs
+
+  local transport="stdio"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --transport) shift; transport="$1" ;;
+      *)           warn "Unknown mcp option: $1" ;;
+    esac
+    shift
+  done
+
+  # Find all workspace DBs and pass them
+  local workspaces
+  workspaces=$(list_configured_workspaces)
+  [[ -z "$workspaces" ]] && die "No workspaces configured."
+
+  local ws
+  ws=$(echo "$workspaces" | head -1)
+  local ws_dir
+  ws_dir=$(workspace_dir "$ws")
+
+  info "Starting MCP server (transport: ${transport})…"
+  slackdump mcp -workspace "$ws" -transport "$transport"
+}
+
+cmd_export() {
+  ensure_sqlite3
+  init_dirs
+
+  local channel_filter=""
+  local format="md"
+  local output_file=""
+  local target_ws=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --channel|-c)   shift; channel_filter="${1#\#}" ;;
+      --format)       shift; format="$1" ;;
+      --output|-o)    shift; output_file="$1" ;;
+      --workspace|-w) shift; target_ws="$1" ;;
+      *)              warn "Unknown export option: $1" ;;
+    esac
+    shift
+  done
+
+  [[ -z "$channel_filter" ]] && die "Usage: slackslaw export --channel \"#name\" [--format md|html] [--output file] [--workspace W]"
+
+  local workspaces
+  if [[ -n "$target_ws" ]]; then
+    workspaces="$target_ws"
+  else
+    workspaces=$(list_configured_workspaces)
+  fi
+  [[ -z "$workspaces" ]] && die "No workspaces configured."
+
+  local output_func
+  if [[ -n "$output_file" ]]; then
+    output_func() { cat > "$output_file"; }
+  else
+    output_func() { cat; }
+  fi
+
+  {
+    while IFS= read -r ws; do
+      [[ -z "$ws" ]] && continue
+      local ws_dir db
+      ws_dir=$(workspace_dir "$ws")
+      db=$(find_workspace_db "$ws_dir")
+      [[ -z "$db" || ! -f "$db" ]] && continue
+
+      local msg_table user_table ch_table
+      msg_table=$(probe_table  "$db" MESSAGE messages message)
+      user_table=$(probe_table "$db" S_USER users user)
+      ch_table=$(probe_table   "$db" CHANNEL channels)
+
+      local text_col user_expr
+      text_col=$(probe_text_col "$db" "$msg_table")
+      user_expr=$(probe_user_expr "$db" "$msg_table")
+
+      local user_cols user_name_expr
+      user_cols=$(sqlite3 "$db" "PRAGMA table_info(${user_table});" 2>/dev/null || true)
+      if echo "$user_cols" | grep -qi '|USERNAME|'; then
+        user_name_expr="COALESCE(u.USERNAME, ${user_expr}, 'unknown')"
+      else
+        user_name_expr="COALESCE(u.real_name, u.name, ${user_expr}, 'unknown')"
+      fi
+      local user_dedup
+      if echo "$user_cols" | grep -qi '|USERNAME|'; then
+        user_dedup="(SELECT ID, USERNAME FROM ${user_table} GROUP BY ID)"
+      else
+        user_dedup="(SELECT ID, real_name, name FROM ${user_table} GROUP BY ID)"
+      fi
+      local ch_dedup="(SELECT ID, NAME FROM ${ch_table} GROUP BY ID)"
+
+      local rows_json
+      rows_json=$(sqlite3 -json "$db" "
+        SELECT m.ts,
+          ${user_name_expr} AS author,
+          COALESCE(c.NAME, m.CHANNEL_ID, '') AS channel,
+          m.${text_col} AS text,
+          m.CHANNEL_ID AS channel_id
+        FROM ${msg_table} m
+        LEFT JOIN ${ch_dedup} c ON c.ID = m.CHANNEL_ID
+        LEFT JOIN ${user_dedup} u ON u.ID = ${user_expr}
+        WHERE LOWER(COALESCE(c.NAME,'')) = LOWER('${channel_filter}')
+          AND m.${text_col} IS NOT NULL AND m.${text_col} != ''
+        GROUP BY m.TS, m.CHANNEL_ID
+        ORDER BY CAST(m.ts AS REAL) ASC;
+      " 2>/dev/null || echo "[]")
+
+      [[ "$rows_json" == "[]" || -z "$rows_json" ]] && continue
+
+      python3 - "$db" "$user_table" "$format" "$channel_filter" "$rows_json" <<'PYEOF'
+import json, re, sqlite3, sys
+from datetime import datetime, timezone
+
+db_path, user_table, fmt, ch_name = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+rows = json.loads(sys.argv[5])
+if not rows:
+    sys.exit(0)
+
+conn = sqlite3.connect(db_path)
+user_map = {}
+try:
+    for r in conn.execute(f"SELECT ID, USERNAME FROM {user_table} GROUP BY ID"):
+        user_map[r[0]] = r[1]
+except:
+    pass
+conn.close()
+
+def prettify_text(text):
+    if not text:
+        return ""
+    def repl_mention(m):
+        return "@" + user_map.get(m.group(1), m.group(1))
+    text = re.sub(r'<@([A-Z0-9]+)(?:\|[^>]*)?>', repl_mention, text)
+    text = re.sub(r'<mailto:([^|>]+)\|([^>]+)>', r'\2', text)
+    def repl_url(m):
+        return f"[{m.group(2)}]({m.group(1)})"
+    text = re.sub(r'<(https?://[^|>]+)\|([^>]+)>', repl_url, text)
+    text = re.sub(r'<(https?://[^>]+)>', r'\1', text)
+    text = re.sub(r'<#[A-Z0-9]+\|([^>]+)>', r'#\1', text)
+    text = re.sub(r'<!([a-z]+)(?:\|[^>]*)?>', r'@\1', text)
+    return text
+
+if fmt == "html":
+    print("<!DOCTYPE html><html><head><meta charset='utf-8'>")
+    print(f"<title>#{ch_name}</title>")
+    print("<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:800px;margin:2em auto;padding:0 1em;line-height:1.6;color:#1d1c1d;}")
+    print(".msg{border-bottom:1px solid #e8e8e8;padding:8px 0;}.author{font-weight:700;}.time{color:#616061;font-size:0.85em;margin-left:8px;}.text{margin-top:4px;white-space:pre-wrap;}</style></head>")
+    print(f"<body><h1>#{ch_name}</h1>")
+    for r in rows:
+        ts = r.get("ts", "")
+        try:
+            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        except:
+            dt = ts
+        author = r.get("author", "unknown")
+        text = prettify_text(r.get("text", "") or r.get("TXT", "") or "")
+        # Escape HTML
+        import html
+        text_html = html.escape(text).replace("\n", "<br>")
+        print(f'<div class="msg"><span class="author">{html.escape(author)}</span><span class="time">{dt}</span><div class="text">{text_html}</div></div>')
+    print("</body></html>")
+else:
+    # Markdown
+    print(f"## #{ch_name}\n")
+    for r in rows:
+        ts = r.get("ts", "")
+        try:
+            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+        except:
+            dt = ts
+        author = r.get("author", "unknown")
+        text = prettify_text(r.get("text", "") or r.get("TXT", "") or "")
+        print(f"**{author}** ({dt}):\n{text}\n\n---\n")
+PYEOF
+    done <<< "$workspaces"
+  } | output_func
+
+  [[ -n "$output_file" ]] && info "Exported to ${output_file}"
 }
 
 cmd_gc() {
@@ -1642,11 +2314,16 @@ ${BOLD}USAGE${RESET}
 ${BOLD}COMMANDS${RESET}
   ${CYAN}auth${RESET}                         Add / re-authenticate a Slack workspace
   ${CYAN}workspaces${RESET}  (alias: ws)      List configured workspaces and stats
+  ${CYAN}workspaces${RESET} add <name>        Alias for auth
+  ${CYAN}workspaces${RESET} remove <name>     Remove a workspace [--delete-data]
   ${CYAN}keywords${RESET}   (alias: kw)      List configured channel keywords
   ${CYAN}keywords${RESET} add <word>          Add a keyword (used by --mine filter)
   ${CYAN}keywords${RESET} remove <word>       Remove a keyword
   ${CYAN}sync${RESET} [--full]                Sync workspaces (incremental by default)
   ${CYAN}sync${RESET} --workspace <n>         Sync a single workspace
+  ${CYAN}sync${RESET} --channel "#name"       Sync a single channel
+  ${CYAN}sync${RESET} --since 30d             Only sync messages from the last 30d/24h/etc
+  ${CYAN}sync${RESET} --quiet                 Cron-friendly: suppress output, exit 0/1
   ${CYAN}whatsnew${RESET}    (alias: new)     Messages received since the last sync
   ${CYAN}whatsnew${RESET} --mine              Only messages relevant to me (+ keywords)
   ${CYAN}whatsnew${RESET} --json              Same, as JSONL (one object per line)
@@ -1656,10 +2333,27 @@ ${BOLD}COMMANDS${RESET}
   ${CYAN}search${RESET} "expr" --workspace W  Limit to one workspace
   ${CYAN}search${RESET} "expr" --channel C    Limit to channel (# prefix optional)
   ${CYAN}search${RESET} "expr" --author A     Limit to author name
-  ${CYAN}search${RESET} "expr" --mine         Only threads I'm in (participated, mentioned, following, starred)
-  ${CYAN}search${RESET} "expr" --newest-first Show newest results first (default: oldest first)
+  ${CYAN}search${RESET} "expr" --mine         Only threads I'm in
+  ${CYAN}search${RESET} "expr" --after 7d     Only messages after date/duration
+  ${CYAN}search${RESET} "expr" --before DATE  Only messages before date/duration
+  ${CYAN}search${RESET} "expr" --slackmd      Raw Slack mrkdwn output (no prettify)
+  ${CYAN}search${RESET} "expr" --format json  Same as --json (works on all commands)
+  ${CYAN}search${RESET} "expr" --newest-first Show newest results first (default: oldest)
   ${CYAN}search${RESET} "expr" --limit N      Max results (default: 20)
   ${CYAN}search${RESET} "expr" --json         JSONL output
+  ${CYAN}threads${RESET} <url>                Dump a thread by Slack URL [--json]
+  ${CYAN}stats${RESET}                        Detailed archive statistics
+  ${CYAN}export${RESET} --channel "#name"     Export channel to markdown or HTML
+  ${CYAN}export${RESET} --format html         Export as HTML (default: md)
+  ${CYAN}export${RESET} --output file.md      Write to file instead of stdout
+  ${CYAN}tail${RESET} -f                      Watch for new messages (live poll)
+  ${CYAN}tail${RESET} --interval 10           Set poll interval in seconds (default: 30)
+  ${CYAN}context${RESET} --since 7d           LLM-ready JSON context dump
+  ${CYAN}ask${RESET} "question"               RAG: ask a question over the archive
+  ${CYAN}ask${RESET} --provider openai        Use OpenAI instead of Anthropic
+  ${CYAN}mcp${RESET}                          Start MCP server (wraps slackdump mcp)
+  ${CYAN}gc${RESET}                           Garbage collect (VACUUM databases)
+  ${CYAN}repair${RESET}                       Check database integrity
   ${CYAN}sql${RESET} 'SELECT ...'             Run raw SQL against the archive DB(s)
   ${CYAN}sql${RESET} -                        Read SQL from stdin
   ${CYAN}status${RESET}                       Archive stats per workspace
@@ -1668,14 +2362,22 @@ ${BOLD}COMMANDS${RESET}
 ${BOLD}EXAMPLES${RESET}
   slackslaw auth
   slackslaw sync --full
-  slackslaw sync
+  slackslaw sync --channel "#ops" --since 7d
   slackslaw whatsnew
   slackslaw whatsnew --json | jq '.text'
-  slackslaw search "incident P0"
+  slackslaw search "incident P0" --after 30d
   slackslaw search "deploy" --channel "#infra" --json
-  slackslaw search "code review" --author petra --limit 50
-  slackslaw sql 'SELECT name, COUNT(*) FROM channels GROUP BY name ORDER BY 2 DESC'
-  echo 'SELECT ts, text FROM messages LIMIT 5' | slackslaw sql -
+  slackslaw search "staging" --slackmd
+  slackslaw threads https://team.slack.com/archives/C0123/p1234567890123456
+  slackslaw stats
+  slackslaw export --channel "#general" > general.md
+  slackslaw export --channel "#general" --format html > general.html
+  slackslaw tail --interval 10 --channel "#ops"
+  slackslaw context --since 24h | head -50
+  ANTHROPIC_API_KEY=... slackslaw ask "what was discussed about staging?"
+  slackslaw gc
+  slackslaw repair
+  slackslaw workspaces remove oldteam --delete-data
 
 ${BOLD}DATA${RESET}
   Archives  : ~/.slackslaw/workspaces/<workspace>/
@@ -1683,12 +2385,14 @@ ${BOLD}DATA${RESET}
   Logs      : ~/.slackslaw/slackslaw.log
 
 ${BOLD}ENVIRONMENT${RESET}
-  SLACKSLAW_DIR   Override base data directory (default: ~/.slackslaw)
-  NO_COLOR        Disable colour output
+  SLACKSLAW_DIR      Override base data directory (default: ~/.slackslaw)
+  NO_COLOR           Disable colour output
+  ANTHROPIC_API_KEY  Required for 'ask' command (default provider)
+  OPENAI_API_KEY     Required for 'ask --provider openai'
 
 ${BOLD}HOW SYNC WORKS${RESET}
   First sync (or --full) : slackdump archive -workspace <ws> -y -o <dir>
-  Subsequent syncs       : slackdump resume -workspace <ws> -y <dir>
+  Subsequent syncs       : slackdump resume -workspace <ws> <dir>
   In slackdump v4, -workspace and -y are per-subcommand flags and must
   come AFTER the subcommand name.
 
@@ -1705,7 +2409,18 @@ main() {
 
   case "$cmd" in
     auth)              cmd_auth       "$@" ;;
-    workspaces|ws)     cmd_workspaces "$@" ;;
+    workspaces|ws)
+      # Handle subcommands: workspaces remove
+      if [[ "${1:-}" == "remove" || "${1:-}" == "rm" ]]; then
+        shift
+        cmd_workspaces_remove "$@"
+      elif [[ "${1:-}" == "add" ]]; then
+        shift
+        cmd_auth "$@"
+      else
+        cmd_workspaces "$@"
+      fi
+      ;;
     keywords|kw)       cmd_keywords   "$@" ;;
     sync)              cmd_sync       "$@" ;;
     whatsnew|new)      cmd_whatsnew   "$@" ;;
@@ -1713,6 +2428,15 @@ main() {
     search)            cmd_search     "$@" ;;
     sql)               cmd_sql        "$@" ;;
     status)            cmd_status     "$@" ;;
+    stats)             cmd_stats      "$@" ;;
+    threads|thread)    cmd_threads    "$@" ;;
+    export)            cmd_export     "$@" ;;
+    tail)              cmd_tail       "$@" ;;
+    context)           cmd_context    "$@" ;;
+    ask)               cmd_ask        "$@" ;;
+    mcp)               cmd_mcp        "$@" ;;
+    gc)                cmd_gc         "$@" ;;
+    repair)            cmd_repair     "$@" ;;
     doctor)            cmd_doctor     "$@" ;;
     help|--help|-h)    cmd_help       ;;
     version|--version|-v)
