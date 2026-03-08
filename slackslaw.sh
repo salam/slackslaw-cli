@@ -1886,16 +1886,16 @@ for ws in workspaces_str.strip().split('\n'):
     except:
         pass
 
-    # Query messages
+    # Query messages (GROUP BY to deduplicate across chunks)
     sql = f\"\"\"
-        SELECT m.ts, json_extract(m.DATA, '$.user') AS uid, m.CHANNEL_ID, m.{text_col}
+        SELECT m.ts, json_extract(m.DATA, '$.user') AS uid, m.CHANNEL_ID, MAX(m.{text_col})
         FROM {msg_table} m
         WHERE CAST(m.ts AS REAL) > {since_ts}
           AND m.{text_col} IS NOT NULL AND m.{text_col} != ''
     \"\"\"
     if channel_filter:
         sql += f\" AND (m.CHANNEL_ID IN (SELECT ID FROM {ch_table} WHERE LOWER(NAME) = LOWER('{channel_filter}')) OR m.CHANNEL_ID = '{channel_filter}')\"
-    sql += f' ORDER BY CAST(m.ts AS REAL) ASC LIMIT {limit}'
+    sql += f' GROUP BY m.TS, m.CHANNEL_ID ORDER BY CAST(m.ts AS REAL) ASC LIMIT {limit}'
 
     rows = conn.execute(sql).fetchall()
     conn.close()
@@ -1907,21 +1907,25 @@ for ws in workspaces_str.strip().split('\n'):
         if ch_name not in channels:
             channels[ch_name] = []
         try:
-            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            dt = datetime.fromtimestamp(float(ts), tz=timezone.utc).strftime('%m-%d %H:%M')
         except:
             dt = str(ts)
-        channels[ch_name].append({
-            'author': user_map.get(uid, uid or 'unknown'),
-            'time': dt,
-            'text': prettify_text(text, user_map)
-        })
+        author = user_map.get(uid, uid or '?')
+        channels[ch_name].append((dt, author, prettify_text(text, user_map)))
 
-    ws_data = {'workspace': ws, 'channels': []}
+    result.append((short, channels))
+
+for ws_name, channels in result:
+    if len(result) > 1:
+        print(f'# {ws_name}')
     for ch_name, msgs in sorted(channels.items()):
-        ws_data['channels'].append({'name': '#' + ch_name, 'messages': msgs})
-    result.append(ws_data)
-
-print(json.dumps(result, indent=2))
+        print(f'## #{ch_name}')
+        for dt, author, text in msgs:
+            # Compact: single line per message, multiline text indented
+            clean = '\n'.join(l.lstrip() for l in text.strip().split('\n') if l.strip())
+            print(f'### {author} ({dt}):')
+            print(clean)
+        print()
 " "$since_ts" "$limit" "$mine_filter" "$channel_filter" "$workspaces" "$WORKSPACES_DIR"
 }
 
