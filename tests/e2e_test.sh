@@ -181,29 +181,30 @@ EOF
       CHANNEL_ID TEXT,
       TXT TEXT,
       THREAD_TS TEXT,
-      DATA TEXT
+      DATA TEXT,
+      NUM_FILES INTEGER DEFAULT 0
     );
 
     -- Messages in #general
-    INSERT INTO MESSAGE VALUES ('1700000010.000000', 'C01GENERAL', 'Hello everyone!', NULL, '{"user":"U02BOB","type":"message"}');
-    INSERT INTO MESSAGE VALUES ('1700000020.000000', 'C01GENERAL', 'Hey <@U02BOB>, welcome!', NULL, '{"user":"U01MYSELF","type":"message"}');
-    INSERT INTO MESSAGE VALUES ('1700000030.000000', 'C01GENERAL', 'Starting deploy to staging', NULL, '{"user":"U03CAROL","type":"message"}');
-    INSERT INTO MESSAGE VALUES ('1700000060.000000', 'C01GENERAL', 'Deploy complete! All green.', NULL, '{"user":"U03CAROL","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000010.000000', 'C01GENERAL', 'Hello everyone!', NULL, '{"user":"U02BOB","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000020.000000', 'C01GENERAL', 'Hey <@U02BOB>, welcome!', NULL, '{"user":"U01MYSELF","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000030.000000', 'C01GENERAL', 'Starting deploy to staging', NULL, '{"user":"U03CAROL","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000060.000000', 'C01GENERAL', 'Deploy complete! All green.', NULL, '{"user":"U03CAROL","type":"message"}');
 
     -- Messages in #ops (thread example)
-    INSERT INTO MESSAGE VALUES ('1700000040.000000', 'C02OPS', 'P0 incident: database timeout', NULL, '{"user":"U04DAVE","type":"message"}');
-    INSERT INTO MESSAGE VALUES ('1700000041.000000', 'C02OPS', 'Looking into it now', '1700000040.000000', '{"user":"U01MYSELF","type":"message"}');
-    INSERT INTO MESSAGE VALUES ('1700000042.000000', 'C02OPS', 'Resolved - connection pool was exhausted', '1700000040.000000', '{"user":"U04DAVE","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000040.000000', 'C02OPS', 'P0 incident: database timeout', NULL, '{"user":"U04DAVE","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000041.000000', 'C02OPS', 'Looking into it now', '1700000040.000000', '{"user":"U01MYSELF","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000042.000000', 'C02OPS', 'Resolved - connection pool was exhausted', '1700000040.000000', '{"user":"U04DAVE","type":"message"}');
 
     -- Message in DM
-    INSERT INTO MESSAGE VALUES ('1700000050.000000', 'D01DM', 'Hey Alice, quick question', NULL, '{"user":"U02BOB","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000050.000000', 'D01DM', 'Hey Alice, quick question', NULL, '{"user":"U02BOB","type":"message"}');
 
     -- Messages in #random
-    INSERT INTO MESSAGE VALUES ('1700000070.000000', 'C03RANDOM', 'Anyone up for lunch?', NULL, '{"user":"U02BOB","type":"message"}');
-    INSERT INTO MESSAGE VALUES ('1700000080.000000', 'C03RANDOM', 'Sure! <@U02BOB>', NULL, '{"user":"U03CAROL","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000070.000000', 'C03RANDOM', 'Anyone up for lunch?', NULL, '{"user":"U02BOB","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1700000080.000000', 'C03RANDOM', 'Sure! <@U02BOB>', NULL, '{"user":"U03CAROL","type":"message"}');
 
     -- Older message (before sync baseline) for whatsnew testing
-    INSERT INTO MESSAGE VALUES ('1699999900.000000', 'C01GENERAL', 'Old message before sync', NULL, '{"user":"U02BOB","type":"message"}');
+    INSERT INTO MESSAGE (TS, CHANNEL_ID, TXT, THREAD_TS, DATA) VALUES ('1699999900.000000', 'C01GENERAL', 'Old message before sync', NULL, '{"user":"U02BOB","type":"message"}');
 SQL
 }
 
